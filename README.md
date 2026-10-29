@@ -34,9 +34,12 @@ wget -O install.sh https://raw.githubusercontent.com/samoyed24/s-ui-light/main/s
 
 4. **是否部署 VLESS + Reality 节点**（y/N）。选 yes 会创建一个 VLESS 入站：
 
+   > **警告：sing-box 对 VLESS 的实现有 BUG，更容易被 GFW 封锁。如确需使用 VLESS 协议，建议使用基于 Xray 的 [3x-ui](https://github.com/MHSanaei/3x-ui)。**
+   > 脚本会在创建询问前用加粗红色警告显示此提醒；`--yes` 模式也会显示。
+
    - Reality 模式，不需要任何证书：服务端借用 SNI 所指站点的握手。密钥对通过
      面板的 `api/keypairs` 接口生成（X25519）
-   - 端口随机取 20000 以上
+   - 默认端口 **443/TCP**（不再随机）；请确保该端口未被其他服务占用
    - SNI 从几个热门站点中随机选一个（与第 3 步独立抽取），handshake 目标同 SNI，443 端口
    - short_id 随机生成（单个随机字节）
    - 客户端侧已开启 uTLS，指纹为 `chrome`
@@ -91,7 +94,7 @@ tail -f /var/log/s-ui.log           # 查看日志
 ./install.sh --no-stats             # 不上报本次运行，不打印总次数
 ```
 
-`--no-prompt` 适合脚本化部署：跳过 HTTPS 与 Hysteria2，只装服务并重置密码。
+`--no-prompt` 适合脚本化部署：跳过 HTTPS、Hysteria2 与 VLESS，只装服务并重置密码。
 没有终端时（如 `curl | sh`、cron）交互问题同样一律按 no 处理，不会卡住等待输入。
 
 密码重置始终执行 —— 装完却保留 `admin/admin` 默认密码，是最容易被扫到的风险。

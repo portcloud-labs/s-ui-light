@@ -857,7 +857,7 @@ random_short_id() {
 # id (sid); s-ui carries both in the TLS record it writes the subscription
 # link from, so the link picks them up automatically.
 deploy_vless_reality() {
-    _port=$(random_port)
+    _port=443
     if ! pick_sni; then
         return 1
     fi
@@ -1127,6 +1127,13 @@ main() {
     #    borrows the handshake of the site it spoofs, and the keypair comes
     #    from the panel itself. The random seed for the SNI draw is refreshed
     #    here, so the two nodes do not always land on the same decoy hostname.
+    printf "\n${RED}\\033[1m"
+    printf '%s\n' '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
+    printf '%s\n' 'WARNING: sing-box has BUGS in its VLESS implementation,'
+    printf '%s\n' 'making it more prone to blocking by the GFW.'
+    printf '%s\n' 'If you need VLESS, use Xray-based 3x-ui instead.'
+    printf '%s\n' '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
+    printf "${NC}\n"
     if ask "Deploy a VLESS + Reality node?"; then
         _RAND=$(od -An -N2 -tu2 < /dev/urandom 2>/dev/null | tr -d ' ' || true)
         case "$_RAND" in
