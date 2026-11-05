@@ -5,29 +5,43 @@
 # Auto-detects the OS (Alpine → OpenRC, Debian/Ubuntu → systemd) and the
 # architecture. Downloads binaries from GitHub Releases (no git needed).
 #
+# The binary is ~100 MiB but the target VPS may have a 64 MiB cgroup hard
+# limit. The download is therefore rate-limited, resumable, streamed straight
+# to disk and verified before it is ever executed. On small-memory hosts the
+# Go runtime also gets a soft heap limit, so the kernel does not OOM-kill the
+# panel (or sshd) a few seconds after startup.
+#
 # After installing, the script optionally:
 #   - sets a random strong password for the admin account (username unchanged)
 #   - generates a self-signed certificate and serves the panel over HTTPS
 #   - deploys a Hysteria2 inbound with a self-signed certificate, a forged SNI
-#     and "allow insecure" enabled
+#     and "allow insecure" enabled, plus Salamander with a separate random password
 #
 # Usage:
 #   ./install.sh [OPTIONS]
 #
 # Options:
-#   --repo <user/repo>  GitHub repo (default: samoyed24/s-ui-light)
-#   --arch <arch>       Force architecture (amd64|arm64). Auto-detected by default.
-#   --install-dir <dir> Installation directory. Default: /usr/local/s-ui
-#   --version <ver>     Specific version to install (default: latest)
-#   --uninstall         Remove s-ui and its service
-#   --no-prompt         Skip every interactive question (answer "no" to each)
-#   --yes               Skip every interactive question (answer "yes" to each)
-#   --no-stats          Do not report this run to the public install counter
-#   -h, --help          Show this help
+#   --repo <user/repo>       GitHub repo (default: samoyed24/s-ui-light)
+#   --arch <arch>            Force architecture (amd64|arm64). Auto-detected by default.
+#   --install-dir <dir>      Installation directory. Default: /usr/local/s-ui
+#   --version <ver>          Specific version to install (default: latest)
+#   --download-rate <rate>   Cap the binary download (default: 512K; 0 = no cap)
+#   --low-mem <auto|on|off>  Go memory guard (default: auto, enabled at <=256 MiB cgroup)
+#   --uninstall              Remove s-ui and its service
+#   --no-prompt              Skip every interactive question (answer "no" to each)
+#   --yes                    Skip every interactive question (answer "yes" to each)
+#   --no-stats               Do not report this run to the public install counter
+#   -h, --help               Show this help
+#
+# Environment (useful for curl | sh, where no flags can be passed):
+#   SUI_DOWNLOAD_RATE   Same as --download-rate
+#   SUI_LOW_MEM         Same as --low-mem
+#   SUI_SHA256          Expected sha256 of sui-<arch>, overrides the release digest
 #
 # Examples:
 #   ./install.sh
 #   ./install.sh --arch arm64
+#   ./install.sh --download-rate 256K --low-mem on
 #   ./install.sh --repo myuser/myrepo --version v1.4.2
 #   ./install.sh --uninstall
 
@@ -87,6 +101,30 @@ CERT_KEY=""
 PANEL_TLS=false
 NO_STATS=false
 
+# ── Low-memory / download defaults ───────────────────────────────────────────
+# curl does every download (it is already required by the panel API). Busybox
+# wget -- the default on Alpine -- has NO --limit-rate, so capping the ~100 MiB
+# binary with wget is impossible without installing GNU wget, and `apk add` is
+# itself one of the first things to OOM on a 64 MiB box.
+DOWNLOAD_RATE="512K"        # curl --limit-rate: 512 KiB/s is ~3.5 min for 106 MiB
+DOWNLOAD_RETRIES=5
+LOW_MEM="auto"              # auto | on | off
+EXPECTED_SHA256=""          # from the release JSON (best effort) or SUI_SHA256
+EXPECTED_SIZE=""            # from the release JSON (best effort)
+RELEASE_JSON=""
+LOW_MEM_ENABLED=false
+MEM_LIMIT_BYTES=""
+GO_MEM_LIMIT=""             # e.g. 40MiB
+GO_GC="30"
+GO_MAXPROCS="1"
+GO_ENV_OPENRC=""            # snippet baked into the OpenRC unit
+GO_ENV_SYSTEMD=""           # snippet baked into the systemd unit
+
+# Environment variables are applied first, so an explicit flag still wins.
+if [ -n "${SUI_DOWNLOAD_RATE:-}" ]; then DOWNLOAD_RATE="$SUI_DOWNLOAD_RATE"; fi
+if [ -n "${SUI_LOW_MEM:-}" ]; then LOW_MEM="$SUI_LOW_MEM"; fi
+if [ -n "${SUI_SHA256:-}" ]; then EXPECTED_SHA256="$SUI_SHA256"; fi
+
 # Ports and names for the generated certificate. The SNI is a decoy: the
 # certificate is self-signed, so its name is only there to look unremarkable
 # to a passive observer, and clients skip verification anyway.
@@ -101,6 +139,8 @@ while [ $# -gt 0 ]; do
         --arch)        ARCH="$2"; shift 2 ;;
         --install-dir) INSTALL_DIR="$2"; shift 2 ;;
         --version)     VERSION="$2"; shift 2 ;;
+        --download-rate) DOWNLOAD_RATE="$2"; shift 2 ;;
+        --low-mem)       LOW_MEM="$2"; shift 2 ;;
         --uninstall)   UNINSTALL=true; shift ;;
         --yes)         ASSUME="yes"; shift ;;
         --no-prompt)   ASSUME="no"; shift ;;
@@ -124,6 +164,34 @@ done
 # Certificates sit next to the binary so --install-dir moves them together.
 CERT_DIR="$INSTALL_DIR/cert"
 
+# Validate the low-memory knobs before any download or package install starts.
+case "$LOW_MEM" in
+    auto|on|off) ;;
+    *)
+        log_error "--low-mem / SUI_LOW_MEM must be auto, on, or off"
+        exit 1
+        ;;
+esac
+case "$DOWNLOAD_RATE" in
+    0)
+        log_warn "Download rate cap disabled (0); not recommended on small-memory hosts"
+        ;;
+    # curl accepts <number>[K|M|G] (also lowercase). Require that exact shape:
+    # 'K512' or an empty suffix would otherwise reach curl as a bad flag.
+    *[0-9]|[0-9]*[KkMmGg])
+        case "$DOWNLOAD_RATE" in
+            ''|*[!0-9KkMmGg]*|*[KkMmGg]*[0-9KkMmGg]*)
+                log_error "Invalid --download-rate: '$DOWNLOAD_RATE' (use e.g. 256K, 1M, or 0)"
+                exit 1
+                ;;
+        esac
+        ;;
+    *)
+        log_error "Invalid --download-rate: '$DOWNLOAD_RATE' (use e.g. 256K, 1M, or 0)"
+        exit 1
+        ;;
+esac
+
 # The service files interpolate these paths, so a value that could break out of
 # a systemd "WorkingDirectory=" line or an OpenRC "directory=" assignment would
 # produce a unit that cannot run -- or worse, one that runs something else.
@@ -140,12 +208,6 @@ case "$INSTALL_DIR" in
         exit 1
         ;;
 esac
-
-# ── Root check ────────────────────────────────────────────────────────────────
-if [ "$(id -u)" -ne 0 ]; then
-    log_error "This script must be run as root"
-    exit 1
-fi
 
 # ── Detect OS ─────────────────────────────────────────────────────────────────
 detect_os() {
@@ -190,28 +252,113 @@ detect_arch() {
     log_info "Detected architecture: $ARCH ($MACHINE)"
 }
 
+# ── Small-memory detection ───────────────────────────────────────────────────
+# `free` is misleading inside a container: on a 64 MiB cgroup it happily
+# reports the host's 5.9 GiB. Only the cgroup files describe the ceiling the
+# OOM killer actually enforces, so those are the only sources used here.
+# The optional argument lets the smoke tests pass a fixture file.
+read_memory_limit_bytes() {
+    _f="${1:-}"
+    if [ -z "$_f" ]; then
+        if [ -r /sys/fs/cgroup/memory.max ]; then                      # cgroup v2
+            _f=/sys/fs/cgroup/memory.max
+        elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then   # cgroup v1
+            _f=/sys/fs/cgroup/memory/memory.limit_in_bytes
+        else
+            return 1
+        fi
+    fi
+    [ -r "$_f" ] || return 1
+    _v=$(cat "$_f" 2>/dev/null || true)
+    case "$_v" in
+        ''|max|*[!0-9]*) return 1 ;;
+    esac
+    # cgroup v1 encodes "unlimited" as 9223372036854771712. Anything with 13+
+    # digits is >= 1 TiB, i.e. not a meaningful small-memory cap -- and feeding
+    # it to -le could overflow a 32-bit shell.
+    if [ ${#_v} -ge 13 ]; then return 1; fi
+    if [ "$_v" -le 0 ]; then return 1; fi
+    echo "$_v"
+}
+
+# Decide whether to switch the Go runtime into low-memory mode, then build the
+# environment snippets that get baked into the OpenRC / systemd units.
+configure_memory_guard() {
+    MEM_LIMIT_BYTES=$(read_memory_limit_bytes || true)
+    if [ -n "$MEM_LIMIT_BYTES" ]; then
+        log_info "Detected cgroup memory limit: $(( MEM_LIMIT_BYTES / 1048576 )) MiB"
+    else
+        log_info "No cgroup memory limit detected"
+    fi
+
+    case "$LOW_MEM" in
+        on)  LOW_MEM_ENABLED=true ;;
+        off) LOW_MEM_ENABLED=false ;;
+        auto)
+            # Below 256 MiB an unmanaged Go heap plus the 100+ MiB mmap'ed
+            # binary starts hitting the ceiling in practice. Above it, do
+            # nothing: a GOMEMLIMIT tuned for 64 MiB would cripple a big host.
+            if [ -n "$MEM_LIMIT_BYTES" ] && [ "$MEM_LIMIT_BYTES" -le 268435456 ]; then
+                LOW_MEM_ENABLED=true
+            else
+                LOW_MEM_ENABLED=false
+            fi
+            ;;
+    esac
+
+    if ! $LOW_MEM_ENABLED; then
+        GO_ENV_OPENRC=""
+        GO_ENV_SYSTEMD=""
+        return 0
+    fi
+
+    # Leave ~40% of the cap for the binary's file-backed pages, the kernel,
+    # sshd and page cache. 5/8 of 64 MiB = 40 MiB, the value verified to keep
+    # s-ui alive on a 64 MiB / 1 CPU container without new OOM kills.
+    if [ -n "$MEM_LIMIT_BYTES" ]; then
+        GO_MEM_LIMIT_MIB=$(( MEM_LIMIT_BYTES / 1048576 * 5 / 8 ))
+    else
+        GO_MEM_LIMIT_MIB=40
+        log_warn "No cgroup limit found; assuming 40 MiB heap (--low-mem override)"
+    fi
+    if [ "$GO_MEM_LIMIT_MIB" -lt 24 ]; then GO_MEM_LIMIT_MIB=24; fi
+    GO_MEM_LIMIT="${GO_MEM_LIMIT_MIB}MiB"
+
+    # Expanded once into the unit files. Values contain no spaces or shell
+    # metacharacters, so neither unit needs quoting.
+    GO_ENV_OPENRC=$(printf 'export GOMEMLIMIT=%s\nexport GOGC=%s\nexport GOMAXPROCS=%s\nexport GODEBUG=madvdontneed=1' \
+        "$GO_MEM_LIMIT" "$GO_GC" "$GO_MAXPROCS")
+    GO_ENV_SYSTEMD=$(printf 'Environment=GOMEMLIMIT=%s\nEnvironment=GOGC=%s\nEnvironment=GOMAXPROCS=%s\nEnvironment=GODEBUG=madvdontneed=1' \
+        "$GO_MEM_LIMIT" "$GO_GC" "$GO_MAXPROCS")
+
+    log_warn "Low-memory mode: GOMEMLIMIT=$GO_MEM_LIMIT GOGC=$GO_GC GOMAXPROCS=$GO_MAXPROCS"
+    log_warn "On a 64 MiB host prefer --no-prompt and avoid opening extra SSH sessions"
+}
+
 # ── Check dependencies ────────────────────────────────────────────────────────
 check_deps() {
-    # curl and openssl are only needed for the optional post-install steps, but
-    # installing them here keeps the whole script on one dependency pass.
-    # busybox wget has no cookie jar, so the panel API calls cannot use it.
+    # Only curl and openssl are needed: curl handles the release API, the
+    # rate-limited binary download AND the panel API (busybox wget has neither
+    # a cookie jar nor --limit-rate). Dropping the wget check matters on a
+    # 64 MiB box, where `apk add` / `apt-get` is a memory-hungry step.
     case "$OS" in
         alpine)
-            local need_wget=false need_openrc=false need_curl=false need_openssl=false
+            local need_openrc=false need_curl=false need_openssl=false
 
-            command -v wget >/dev/null 2>&1 || need_wget=true
             command -v rc-service >/dev/null 2>&1 || command -v rc-update >/dev/null 2>&1 || need_openrc=true
             command -v curl >/dev/null 2>&1 || need_curl=true
             command -v openssl >/dev/null 2>&1 || need_openssl=true
 
-            if $need_wget || $need_openrc || $need_curl || $need_openssl; then
+            if $need_openrc || $need_curl || $need_openssl; then
                 local packages=""
-                $need_wget && packages="$packages wget"
                 $need_openrc && packages="$packages openrc"
                 $need_curl && packages="$packages curl"
                 $need_openssl && packages="$packages openssl"
 
                 log_info "Installing missing dependencies:$packages"
+                if $LOW_MEM_ENABLED; then
+                    log_warn "Package installation can be memory-heavy on small containers"
+                fi
                 apk add --no-cache $packages
                 if [ $? -ne 0 ]; then
                     log_error "Failed to install dependencies. Run manually: apk add$packages"
@@ -221,15 +368,13 @@ check_deps() {
             fi
             ;;
         debian)
-            local need_wget=false need_curl=false need_openssl=false
+            local need_curl=false need_openssl=false
 
-            command -v wget >/dev/null 2>&1 || need_wget=true
             command -v curl >/dev/null 2>&1 || need_curl=true
             command -v openssl >/dev/null 2>&1 || need_openssl=true
 
-            if $need_wget || $need_curl || $need_openssl; then
+            if $need_curl || $need_openssl; then
                 local packages=""
-                $need_wget && packages="$packages wget"
                 $need_curl && packages="$packages curl"
                 $need_openssl && packages="$packages openssl"
 
@@ -249,32 +394,141 @@ check_deps() {
 # ── Get version ───────────────────────────────────────────────────────────────
 get_version() {
     if [ "$VERSION" = "latest" ]; then
-        _body=$(wget -qO- "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)
+        # -fsSL follows the 301 a renamed/transferred repo returns, which the
+        # old busybox-wget path had to emulate by hand. --max-time keeps a
+        # stalled API call from holding the install open on a tiny host.
+        RELEASE_JSON=$(curl -fsSL --connect-timeout 20 --max-time 60 \
+            "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)
 
-        # A renamed or transferred repository answers this endpoint with 301 and
-        # a "Moved Permanently" body naming a numeric id, not with releases.
-        # wget does not follow it, so the tag comes back empty. Follow the
-        # redirect explicitly: opaque, but far better than failing the install
-        # with "Failed to fetch latest version" on a repo that still exists.
-        if [ -z "$_body" ] || ! echo "$_body" | grep -q '"tag_name"'; then
-            _moved=$(echo "$_body" | sed -n 's/.*"url": *"\([^"]*\)".*/\1/p' | head -1)
-            if [ -n "$_moved" ]; then
-                log_warn "GitHub reports this repository has moved; following the redirect"
-                _body=$(wget -qO- "$_moved" 2>/dev/null || true)
-            fi
-        fi
-
-        VERSION=$(echo "$_body" | grep '"tag_name"' | head -1 | sed 's/.*: "//;s/".*//')
+        VERSION=$(printf '%s' "$RELEASE_JSON" | grep '"tag_name"' | head -1 | sed 's/.*: "//;s/".*//')
         if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
             log_error "Failed to fetch the latest version from GitHub ($REPO)"
             log_error "Check the repo name with --repo <user/repo>, or pass --version <ver>"
             exit 1
+        fi
+
+        # Best-effort integrity metadata for sui-$ARCH. GitHub's release JSON
+        # is pretty-printed ("name": "sui-amd64") and every asset carries the
+        # same "size"/"digest" keys, so a global grep would pick the FIRST
+        # asset's values. Walk the lines instead: remember the most recently
+        # seen asset name, then keep the size/digest that belong to that name.
+        # Whitespace after ':' is ignored. Neither field is fatal when absent
+        # (forks, mirrors, --version): verify_binary still checks ELF magic and
+        # a minimum size, so a corrupt binary can never be started.
+        _meta=$(printf '%s\n' "$RELEASE_JSON" | awk -v want="sui-$ARCH" '
+            /"name"[[:space:]]*:/ {
+                nm=$0
+                sub(/.*"name"[[:space:]]*:[[:space:]]*"/, "", nm)
+                sub(/".*/, "", nm)
+                next
+            }
+            nm == want && /"size"[[:space:]]*:/ {
+                v=$0; sub(/.*"size"[[:space:]]*:[[:space:]]*/, "", v)
+                sub(/[^0-9].*/, "", v); size=v; next
+            }
+            nm == want && /"digest"[[:space:]]*:/ {
+                v=$0; sub(/.*sha256:/, "", v); sub(/".*/, "", v)
+                digest=v; next
+            }
+            END { if (size != "" || digest != "") print size " " digest }
+        ' 2>/dev/null || true)
+        EXPECTED_SIZE=$(printf '%s' "$_meta" | awk '{print $1}')
+        if [ -z "${SUI_SHA256:-}" ]; then
+            EXPECTED_SHA256=$(printf '%s' "$_meta" | awk '{print $2}')
+        fi
+        # Guard against a partially parsed block: a digest must be 64 hex chars.
+        case "$EXPECTED_SHA256" in
+            *[!0-9a-fA-F]*|'') EXPECTED_SHA256="" ;;
+        esac
+        if [ ${#EXPECTED_SHA256} -ne 64 ] 2>/dev/null; then EXPECTED_SHA256=""; fi
+        if [ -n "$EXPECTED_SHA256" ]; then
+            log_info "Release checksum: sha256:$EXPECTED_SHA256"
         fi
     fi
     log_info "Target version: $VERSION"
 }
 
 # ── Download files ────────────────────────────────────────────────────────────
+# verify_binary FILE: refuse truncated files, HTML error pages and checksum
+# mismatches. Executing a half-downloaded Go binary turns a transient network
+# or OOM blip into a restart loop that hammers a 64 MiB box.
+verify_binary() {
+    _f="$1"
+    [ -f "$_f" ] || return 1
+    _sz=$(wc -c < "$_f" | tr -d ' ')
+    # A real sui binary is 100+ MiB. This mainly catches a truncated ELF whose
+    # first four bytes still look valid.
+    if [ "$_sz" -le 10485760 ]; then
+        log_warn "Downloaded file is only $_sz bytes; treating as incomplete"
+        return 1
+    fi
+    _magic=$(od -An -tx1 -N4 "$_f" 2>/dev/null | tr -d ' \n' || true)
+    if [ "$_magic" != "7f454c46" ]; then
+        log_warn "Downloaded file is not an ELF binary (magic: '$_magic')"
+        return 1
+    fi
+    if [ -n "$EXPECTED_SIZE" ] && [ "$_sz" != "$EXPECTED_SIZE" ]; then
+        log_warn "Size mismatch: got $_sz, expected $EXPECTED_SIZE"
+        return 1
+    fi
+    if [ -n "$EXPECTED_SHA256" ] && command -v sha256sum >/dev/null 2>&1; then
+        _got=$(sha256sum "$_f" | awk '{print $1}')
+        if [ "$_got" != "$EXPECTED_SHA256" ]; then
+            log_warn "Checksum mismatch (got $_got)"
+            return 1
+        fi
+        log_info "Checksum verified (sha256)"
+    fi
+    return 0
+}
+
+# download_binary URL DEST: rate-limited, resumable, streamed straight to disk.
+# The body is NEVER captured in a shell variable -- on a 64 MiB cgroup that
+# alone is fatal. -C - resumes after an OOM-killed curl; --limit-rate caps how
+# fast page cache can grow; --speed-time/--speed-limit abort a dead connection.
+download_binary() {
+    _url="$1"; _dest="$2"
+    _part="$_dest.part"
+    _log="$_dest.part.log"
+    _i=0
+    while [ "$_i" -lt "$DOWNLOAD_RETRIES" ]; do
+        _i=$(( _i + 1 ))
+        # Word-splitting of $_rate_args is intentional: it is either empty or
+        # exactly two safe, literal words produced by this script.
+        if [ "$DOWNLOAD_RATE" = "0" ]; then
+            _rate_args=""
+            log_info "Downloading (attempt $_i/$DOWNLOAD_RETRIES, no rate cap)"
+        else
+            _rate_args="--limit-rate $DOWNLOAD_RATE"
+            log_info "Downloading (attempt $_i/$DOWNLOAD_RETRIES, capped at $DOWNLOAD_RATE)"
+        fi
+        if curl -fL $_rate_args -C - \
+                --connect-timeout 20 --speed-time 60 --speed-limit 1024 \
+                --max-time 3600 -o "$_part" "$_url" 2>"$_log"; then
+            if verify_binary "$_part"; then
+                mv -f "$_part" "$_dest"
+                rm -f "$_log"
+                sync 2>/dev/null || true
+                log_info "Download verified and installed ($(wc -c < "$_dest" | tr -d ' ') bytes)"
+                return 0
+            fi
+            log_warn "Verification failed; discarding the partial file"
+            rm -f "$_part"
+        else
+            log_warn "Download attempt $_i failed"
+            # curl error 33 == server does not support byte ranges. A resumed
+            # transfer can then never complete, so restart from zero once.
+            if grep -q -e "byte ranges" -e "error 33" "$_log" 2>/dev/null; then
+                rm -f "$_part"
+            fi
+        fi
+        sleep 3
+    done
+    rm -f "$_part" "$_log"
+    log_error "Download failed after $DOWNLOAD_RETRIES attempts"
+    return 1
+}
+
 download_files() {
     local base_url="https://github.com/$REPO/releases/download/$VERSION"
 
@@ -284,26 +538,42 @@ download_files() {
     mkdir -p "$INSTALL_DIR"
     mkdir -p "$DATA_DIR"
 
-    # Download main binary (with arch suffix).
-    # No --show-progress: Alpine's wget is the busybox applet, whose long-option
-    # table has no such flag. busybox getopt32 calls bb_show_usage() and exits
-    # non-zero on an unknown long option, so the download would fail on every
-    # Alpine host. It also contradicts -q, which is already passed.
-    log_info "Downloading sui-$ARCH..."
-    wget -q -O "$INSTALL_DIR/sui" "$base_url/sui-$ARCH" || {
+    # On an upgrade, stop the running panel before replacing its binary:
+    # keeping the old mmap'ed 100+ MiB image AND writing the new one at the
+    # same time is exactly the double allocation that trips a 64 MiB cap.
+    SUI_STOPPED=""
+    if [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1 \
+            && rc-service s-ui status >/dev/null 2>&1; then
+        rc-service s-ui stop >/dev/null 2>&1 || true
+        SUI_STOPPED="openrc"
+    elif [ "$OS" = "debian" ] && command -v systemctl >/dev/null 2>&1 \
+            && systemctl is-active --quiet s-ui 2>/dev/null; then
+        systemctl stop s-ui >/dev/null 2>&1 || true
+        SUI_STOPPED="systemd"
+    fi
+
+    download_binary "$base_url/sui-$ARCH" "$INSTALL_DIR/sui" || {
         log_error "Failed to download sui-$ARCH. Check if version $VERSION exists"
+        # A failed upgrade must not leave the previously working panel down.
+        # The old binary was never replaced (downloads land in sui.part), so
+        # starting the service again is safe.
+        if [ -n "$SUI_STOPPED" ] && [ -x "$INSTALL_DIR/sui" ]; then
+            log_warn "Restoring the s-ui service after the failed download"
+            if [ "$SUI_STOPPED" = "openrc" ]; then
+                rc-service s-ui start >/dev/null 2>&1 || true
+            else
+                systemctl start s-ui >/dev/null 2>&1 || true
+            fi
+        fi
         exit 1
     }
-    chmod +x "$INSTALL_DIR/sui"
+    chmod 755 "$INSTALL_DIR/sui"
 
-    # Download optional management script
-    log_info "Downloading s-ui-$ARCH.sh..."
-    wget -q -O "$INSTALL_DIR/s-ui.sh" "$base_url/s-ui-$ARCH.sh" 2>/dev/null || true
-    chmod +x "$INSTALL_DIR/s-ui.sh" 2>/dev/null || true
+    # The optional s-ui-<arch>.sh management helper is intentionally NOT
+    # downloaded: the service does not need it, and it is one more network
+    # round-trip on a host that can barely afford this one.
 
-    # Save version
     echo "$VERSION" > "$INSTALL_DIR/version.txt"
-
     log_info "Installed s-ui $VERSION ($ARCH) to $INSTALL_DIR"
 }
 
@@ -394,6 +664,9 @@ directory="$INSTALL_DIR"
 output_log="$LOG_FILE"
 error_log="$LOG_FILE"
 
+# Go runtime guard (empty on hosts with plenty of RAM).
+$GO_ENV_OPENRC
+
 depend() {
     need net
     after firewall
@@ -433,6 +706,8 @@ RestartSec=5
 LimitNOFILE=1048576
 StandardOutput=append:$LOG_FILE
 StandardError=append:$LOG_FILE
+# Go runtime guard (empty on hosts with plenty of RAM).
+$GO_ENV_SYSTEMD
 
 [Install]
 WantedBy=multi-user.target
@@ -505,7 +780,15 @@ service_restart() {
 # database from the directory of argv[0], so /etc/s-ui (which the community
 # script creates and this one kept) is not where the data lives.
 sui() {
-    "$INSTALL_DIR/sui" "$@"
+    # Short-lived CLI invocations (admin, setting -show) are Go processes too
+    # and run OUTSIDE the service unit. Without the same guard they are exactly
+    # the processes that get OOM-killed while the panel survives.
+    if $LOW_MEM_ENABLED; then
+        GOMEMLIMIT="$GO_MEM_LIMIT" GOGC="$GO_GC" GOMAXPROCS="$GO_MAXPROCS" \
+            GODEBUG=madvdontneed=1 "$INSTALL_DIR/sui" "$@"
+    else
+        "$INSTALL_DIR/sui" "$@"
+    fi
 }
 
 # ── Generate a random password ───────────────────────────────────────────────
@@ -664,6 +947,7 @@ ensure_session() {
 # derived data (out_json, subscription links) and reloads sing-box inside this
 # call, so writing the database directly would produce a node that exists but
 # carries no usable link.
+# Save responses can contain inbound passwords; never include them in logs.
 panel_save() {
     _object="$1"; _action="$2"; _data="$3"
     panel_request POST "save" \
@@ -684,7 +968,7 @@ enable_panel_tls() {
     case "$_out" in
         *'"success":true'*) ;;
         *)
-            log_error "Failed to enable HTTPS: $(echo "$_out" | head -c 200)"
+            log_error "Failed to enable HTTPS"
             return 1
             ;;
     esac
@@ -749,7 +1033,15 @@ deploy_hysteria2() {
     fi
     _sni="$SNI"
 
-    log_info "Deploying a Hysteria2 node..."
+    # Never create an unobfuscated inbound if secure randomness is unavailable.
+    # This password is independent of admin credentials and client authentication.
+    _obfs_pass=$(random_password)
+    if [ ${#_obfs_pass} -ne 24 ]; then
+        log_error "Failed to generate a Salamander password; skipping Hysteria2"
+        return 1
+    fi
+
+    log_info "Deploying a Hysteria2 node with Salamander..."
     log_info "  Port: $_port  SNI: $_sni"
 
     # 1. TLS config: the certificate, the forged SNI, and "allow insecure" on
@@ -760,7 +1052,7 @@ deploy_hysteria2() {
     case "$_out" in
         *'"success":true'*) ;;
         *)
-            log_error "Failed to create the TLS config: $(echo "$_out" | head -c 200)"
+            log_error "Failed to create the TLS config"
             return 1
             ;;
     esac
@@ -789,12 +1081,13 @@ deploy_hysteria2() {
     # 2. The inbound itself. The tag is unique and carries the port, so a
     #    second run makes a new node instead of colliding with this one.
     _tag="$HY2_TAG_PREFIX-$_port"
-    _inb="{\"id\":0,\"type\":\"hysteria2\",\"tag\":\"$_tag\",\"tls_id\":$_tls_id,\"listen\":\"::\",\"listen_port\":$_port,\"addrs\":[],\"out_json\":{}}"
+    _inb="{\"id\":0,\"type\":\"hysteria2\",\"tag\":\"$_tag\",\"tls_id\":$_tls_id,\"listen\":\"::\",\"listen_port\":$_port,\"obfs\":{\"type\":\"salamander\",\"password\":\"$_obfs_pass\"},\"addrs\":[],\"out_json\":{}}"
     _out=$(panel_save inbounds new "$_inb")
     case "$_out" in
         *'"success":true'*) ;;
         *)
-            log_error "Failed to create the Hysteria2 inbound: $(echo "$_out" | head -c 200)"
+            # The response may echo the inbound, including its obfuscation password.
+            log_error "Failed to create the Hysteria2 inbound"
             return 1
             ;;
     esac
@@ -880,7 +1173,7 @@ deploy_vless_reality() {
     case "$_out" in
         *'"success":true'*) ;;
         *)
-            log_error "Failed to create the Reality TLS config: $(echo "$_out" | head -c 200)"
+            log_error "Failed to create the Reality TLS config"
             return 1
             ;;
     esac
@@ -915,7 +1208,7 @@ deploy_vless_reality() {
     case "$_out" in
         *'"success":true'*) ;;
         *)
-            log_error "Failed to create the VLESS inbound: $(echo "$_out" | head -c 200)"
+            log_error "Failed to create the VLESS inbound"
             return 1
             ;;
     esac
@@ -984,6 +1277,7 @@ show_summary() {
         printf "  Hysteria2 node: %s\n" "$HY2_TAG"
         printf "    Port: %s/UDP\n" "$HY2_PORT"
         printf "    SNI:  %s\n" "$HY2_SNI"
+        printf "    Obfuscation: Salamander (included in panel subscriptions)\n"
         printf "    Add a client in the panel to get a subscription link.\n"
         if [ -n "$_host" ] && [ "$_host" != "<server-ip>" ]; then
             printf "    ${YELLOW}Open %s/UDP in your firewall/security group.${NC}\n" "$HY2_PORT"
@@ -1046,6 +1340,13 @@ report_run() {
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
+    # Kept here rather than at the top level so --help works for non-root and
+    # so SUI_LIB_ONLY can source the helpers in the smoke tests.
+    if [ "$(id -u)" -ne 0 ]; then
+        log_error "This script must be run as root"
+        exit 1
+    fi
+
     detect_os
 
     if $UNINSTALL; then
@@ -1055,6 +1356,7 @@ main() {
     log_info "=== s-ui Installer ($OS) ==="
 
     detect_arch
+    configure_memory_guard
     check_deps
     get_version
     download_files
@@ -1105,7 +1407,7 @@ main() {
 
     # 3. Offer a Hysteria2 node. The certificate from step 2 is reused when it
     #    exists; otherwise one is generated now, since the protocol requires TLS.
-    if ask "Deploy a Hysteria2 node?"; then
+    if ask "Deploy a Hysteria2 node with Salamander obfuscation?"; then
         # Hysteria2 requires TLS. Reuse the certificate from step 2, or make
         # one now if that step was declined.
         [ -n "$CERT_CRT" ] || generate_cert || log_warn "Certificate generation failed"
@@ -1164,4 +1466,6 @@ main() {
     report_run
 }
 
-main
+# SUI_LIB_ONLY lets the smoke tests source this file to exercise the pure
+# helpers without running an install. It has no effect on normal usage.
+[ "${SUI_LIB_ONLY:-0}" = "1" ] || main

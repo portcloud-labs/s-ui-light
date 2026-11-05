@@ -31,6 +31,14 @@ wget -O install.sh https://raw.githubusercontent.com/samoyed24/s-ui-light/main/s
    - 端口随机取 20000 以上
    - SNI 从几个热门站点中随机选一个
    - 已开启「允许不安全」（`client.insecure`），客户端无需校验证书
+   - 新建入站默认启用 Salamander 混淆，每个入站独立生成 24 位安全随机字母数字密码；
+     随机生成失败时跳过创建，不会降级为无混淆入站
+
+   混淆密码与**管理员密码、客户端认证密码不同**，不会在安装日志或摘要中打印。
+   在面板中新增客户端并勾选该入站后，面板原生 URI/Mihomo 订阅会自动携带 Salamander
+   参数与混淆密码，无需脚本另行拼接。请将订阅作为敏感信息保管，并使用支持 Salamander 的客户端。
+   此默认设置**只作用于脚本新建的 Hysteria2 入站**，不会自动修改已有节点或其他协议。
+   Salamander 仅提供混淆，不是抗封锁或防探测保证；本次不配置 masquerade。
 
 4. **是否部署 VLESS + Reality 节点**（y/N）。选 yes 会创建一个 VLESS 入站：
 
@@ -88,6 +96,8 @@ tail -f /var/log/s-ui.log           # 查看日志
 ```bash
 ./install.sh --arch arm64           # 指定架构（默认自动检测）
 ./install.sh --version v1.4.2       # 指定版本（默认最新）
+./install.sh --download-rate 256K    # 下载限速（默认 512K；0 表示不限速）
+./install.sh --low-mem on           # 强制低内存模式（默认 auto 自动检测）
 ./install.sh --uninstall            # 卸载
 ./install.sh --no-prompt            # 全部交互问题都答 no（无人值守）
 ./install.sh --yes                  # 全部交互问题都答 yes
@@ -98,6 +108,50 @@ tail -f /var/log/s-ui.log           # 查看日志
 没有终端时（如 `curl | sh`、cron）交互问题同样一律按 no 处理，不会卡住等待输入。
 
 密码重置始终执行 —— 装完却保留 `admin/admin` 默认密码，是最容易被扫到的风险。
+
+## 小内存 / 64 MB 容器与限速下载
+
+`s-ui` 的二进制约 100 MiB，而目标机器可能只有 **64 MiB 的 cgroup 硬限制**。安装脚本针对这种情况做了几件事：
+
+- **下载默认限速 512K**（约 512 KiB/s，106 MiB 约 3.5 分钟），可用 `--download-rate` 调整，
+  或设环境变量 `SUI_DOWNLOAD_RATE`。`0` 表示不限速，**不建议在小内存机器上用**。
+  Alpine 自带的 busybox `wget` 没有 `--limit-rate`，所以下载统一改用脚本本来就依赖的 `curl`；
+  同时不再检查/安装 `wget`，少一次 `apk add`（包管理本身也很吃内存）。
+- **流式写盘 + 断点续传**：响应体直接写入 `sui.part`，绝不读进 shell 变量；
+  `curl -C -` 支持中断后续传，最多重试 5 次。限速能避免 page cache 瞬时涨满，
+  减少内核回收抖动和误伤 `sshd` 等进程。
+- **完整性校验**：下载完成后校验 ELF 魔数、最小体积，并尽力从 GitHub Release API 取
+  `size` / `sha256` digest 比对（也可用 `SUI_SHA256` 手工指定）。校验不过就丢弃重下，
+  **不会把残缺二进制 chmod 后启动** —— 否则会变成崩溃重启循环，反复冲击内存。
+- **自动 Go 运行时护栏**：脚本读 `/sys/fs/cgroup/memory.max`（cgroup v2）或
+  `memory.limit_in_bytes`（v1）判断真实上限；**不看 `free`**，因为容器里 `free` 报的是
+  宿主机内存（实测 5.9 GiB vs 真实 64 MiB）。当上限 ≤ 256 MiB 时自动注入：
+
+  | 变量 | 值 | 作用 |
+  |---|---|---|
+  | `GOMEMLIMIT` | 上限的 5/8（64 MiB → `40MiB`） | Go 软内存上限，提前触发 GC |
+  | `GOGC` | `30` | 更激进的 GC 目标 |
+  | `GOMAXPROCS` | `1` | 限制 GC/辅助线程，适配 1 核容器 |
+  | `GODEBUG` | `madvdontneed=1` | 释放内存时立即归还内核 |
+
+  这些变量同时写进 **OpenRC / systemd 单元** 和脚本直接调起的 `sui admin` / `sui setting`
+  短命进程（后者不走 service，最容易漏）。`--low-mem off` 可完全关闭；`auto`（默认）只在
+  检测到小 cgroup 时启用，**大内存机器不受影响**。
+- **升级时先停服务再换二进制**，避免新旧两份 100+ MiB mmap 镜像同时占内存。
+- 不再下载可选的 `s-ui-<arch>.sh` 管理脚本（服务不需要它）。
+
+推荐在极小内存容器上的用法：
+
+```bash
+./install.sh --no-prompt --no-stats --download-rate 256K
+```
+
+`--no-prompt` 不建任何入站，内存占用最低。已在 64 MiB / 1 CPU 的 Alpine 容器上验证：
+安装与运行期间 `oom_kill` 计数未增加，面板 HTTPS 与登录正常。注意 64 MiB 依然非常紧，
+反复新开 SSH 会话可能挤掉 sshd 的 pre-auth 进程；如需多开节点，建议把容器限额提到 128–256 MiB。
+
+> 端口转发：容器内监听 2095/2096/TCP 与 Hysteria2 的 UDP 端口，是否在公网可达取决于
+> 宿主机的 NAT/端口映射，脚本无法代劳。
 
 ## 运行次数统计
 
@@ -121,3 +175,9 @@ tail -f /var/log/s-ui.log           # 查看日志
 - 不想上报就加 `--no-stats`，或直接不跑这一步。
 
 GitHub Release 的下载量不是替代方案 —— 它只反映有多少人下载过，不是运行次数。
+
+## Salamander 验证范围
+
+已在 Debian 12 / arm64 隔离容器中运行 s-ui v1.6.6（sing-box v1.14.4），调用安装器的实际入站创建函数，验证每个入站的混淆密码独立、原生 URI/Mihomo 订阅携带正确参数，并用 Mihomo v1.19.32 完成 HTTPS 访问和 UDP DNS 查询。错误或缺失混淆密码无法代理；随机密码生成不足 24 位时不创建入站；面板与核心重启后密钥保留且仍可连接。
+
+此项验证不覆盖完整安装流程、跨 GFW 可用性或抗封锁效果。
