@@ -15,6 +15,9 @@ wget -O install.sh https://raw.githubusercontent.com/samoyed24/s-ui-light/main/s
 - **Alpine Linux** → OpenRC 服务（`rc-service` / `rc-update`）
 - **Debian / Ubuntu** → systemd 服务（`systemctl`）
 
+开始下载前会询问一次是否限速（默认 1M/s）。小内存机器全速下载可能触发 OOM，建议保持默认；
+大内存机器可以选不限速。下载过程带进度条。
+
 ## 安装后会做什么
 
 安装完服务后，脚本会依次询问并完成四件事：
@@ -96,16 +99,17 @@ tail -f /var/log/s-ui.log           # 查看日志
 ```bash
 ./install.sh --arch arm64           # 指定架构（默认自动检测）
 ./install.sh --version v1.4.2       # 指定版本（默认最新）
-./install.sh --download-rate 256K    # 下载限速（默认 512K；0 表示不限速）
+./install.sh --download-rate 256K   # 下载限速（默认 1M；0 表示不限速，跳过询问）
 ./install.sh --low-mem on           # 强制低内存模式（默认 auto 自动检测）
 ./install.sh --uninstall            # 卸载
-./install.sh --no-prompt            # 全部交互问题都答 no（无人值守）
+./install.sh --no-prompt            # 跳过所有交互（无人值守；下载仍限速 1M）
 ./install.sh --yes                  # 全部交互问题都答 yes
 ./install.sh --no-stats             # 不上报本次运行，不打印总次数
 ```
 
 `--no-prompt` 适合脚本化部署：跳过 HTTPS、Hysteria2 与 VLESS，只装服务并重置密码。
-没有终端时（如 `curl | sh`、cron）交互问题同样一律按 no 处理，不会卡住等待输入。
+没有终端时（如 `curl | sh`、cron）会跳过所有交互问题，不会卡住等待输入；下载仍按默认
+1M/s 限速（无人值守时不会擅自改成不限速）。
 
 密码重置始终执行 —— 装完却保留 `admin/admin` 默认密码，是最容易被扫到的风险。
 
@@ -113,9 +117,16 @@ tail -f /var/log/s-ui.log           # 查看日志
 
 `s-ui` 的二进制约 100 MiB，而目标机器可能只有 **64 MiB 的 cgroup 硬限制**。安装脚本针对这种情况做了几件事：
 
-- **下载默认限速 512K**（约 512 KiB/s，106 MiB 约 3.5 分钟），可用 `--download-rate` 调整，
-  或设环境变量 `SUI_DOWNLOAD_RATE`。`0` 表示不限速，**不建议在小内存机器上用**。
-  Alpine 自带的 busybox `wget` 没有 `--limit-rate`，所以下载统一改用脚本本来就依赖的 `curl`；
+- **下载限速可选，默认 1M/s**（106 MiB 约 1.8 分钟）。脚本在下载前询问一次：
+  按回车保持 1M 限速，答 `n` 则不限速。询问时会明确提示：内存上限 ≤ 256 MiB 时，
+  全速下载会瞬间占满 page cache，可能触发 OOM —— 有时杀掉的是 `sshd` 而不是安装脚本，
+  这种机器应保持限速。也可用 `--download-rate`（如 `256K`、`2M`、`0`）或环境变量
+  `SUI_DOWNLOAD_RATE` 直接指定并跳过询问。
+  `--yes` / `--no-prompt` / 无终端（`curl | sh`、cron）时不会询问，保持默认 1M ——
+  不会因为「无人值守」意外变成不限速。
+- **下载进度条**：stderr 是终端时用 `curl --progress-bar` 显示单行进度条
+  （百分比、速度、剩余时间）；输出被重定向到文件或管道时自动静默，避免进度字符污染日志。
+- Alpine 自带的 busybox `wget` 没有 `--limit-rate`，所以下载统一改用脚本本来就依赖的 `curl`；
   同时不再检查/安装 `wget`，少一次 `apk add`（包管理本身也很吃内存）。
 - **流式写盘 + 断点续传**：响应体直接写入 `sui.part`，绝不读进 shell 变量；
   `curl -C -` 支持中断后续传，最多重试 5 次。限速能避免 page cache 瞬时涨满，

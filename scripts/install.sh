@@ -6,10 +6,12 @@
 # architecture. Downloads binaries from GitHub Releases (no git needed).
 #
 # The binary is ~100 MiB but the target VPS may have a 64 MiB cgroup hard
-# limit. The download is therefore rate-limited, resumable, streamed straight
-# to disk and verified before it is ever executed. On small-memory hosts the
-# Go runtime also gets a soft heap limit, so the kernel does not OOM-kill the
-# panel (or sshd) a few seconds after startup.
+# limit. The download is therefore rate-limited by default (1M/s), resumable,
+# streamed straight to disk, shown with a progress bar on a terminal, and
+# verified before it is ever executed. The operator can switch the cap off at
+# the prompt or with --download-rate 0. On small-memory hosts the Go runtime
+# also gets a soft heap limit, so the kernel does not OOM-kill the panel (or
+# sshd) a few seconds after startup.
 #
 # After installing, the script optionally:
 #   - sets a random strong password for the admin account (username unchanged)
@@ -25,10 +27,12 @@
 #   --arch <arch>            Force architecture (amd64|arm64). Auto-detected by default.
 #   --install-dir <dir>      Installation directory. Default: /usr/local/s-ui
 #   --version <ver>          Specific version to install (default: latest)
-#   --download-rate <rate>   Cap the binary download (default: 512K; 0 = no cap)
+#   --download-rate <rate>   Cap the binary download (default: 1M; 0 = no cap).
+#                            Skips the interactive rate question.
 #   --low-mem <auto|on|off>  Go memory guard (default: auto, enabled at <=256 MiB cgroup)
 #   --uninstall              Remove s-ui and its service
-#   --no-prompt              Skip every interactive question (answer "no" to each)
+#   --no-prompt              Skip every interactive question. Post-install steps
+#                            stay off; the download cap stays on (1M/s)
 #   --yes                    Skip every interactive question (answer "yes" to each)
 #   --no-stats               Do not report this run to the public install counter
 #   -h, --help               Show this help
@@ -106,7 +110,13 @@ NO_STATS=false
 # wget -- the default on Alpine -- has NO --limit-rate, so capping the ~100 MiB
 # binary with wget is impossible without installing GNU wget, and `apk add` is
 # itself one of the first things to OOM on a 64 MiB box.
-DOWNLOAD_RATE="512K"        # curl --limit-rate: 512 KiB/s is ~3.5 min for 106 MiB
+#
+# 1M is the default because 512K made a normal install feel broken on a fast
+# link, while unlimited still fills a 64 MiB box's page cache faster than the
+# kernel can reclaim it. choose_download_rate() lets the operator turn the cap
+# off after reading that trade-off.
+DOWNLOAD_RATE="1M"          # curl --limit-rate: 1 MiB/s is ~106 s for 106 MiB
+DOWNLOAD_RATE_EXPLICIT=false  # set by --download-rate / SUI_DOWNLOAD_RATE
 DOWNLOAD_RETRIES=5
 LOW_MEM="auto"              # auto | on | off
 EXPECTED_SHA256=""          # from the release JSON (best effort) or SUI_SHA256
@@ -121,7 +131,10 @@ GO_ENV_OPENRC=""            # snippet baked into the OpenRC unit
 GO_ENV_SYSTEMD=""           # snippet baked into the systemd unit
 
 # Environment variables are applied first, so an explicit flag still wins.
-if [ -n "${SUI_DOWNLOAD_RATE:-}" ]; then DOWNLOAD_RATE="$SUI_DOWNLOAD_RATE"; fi
+if [ -n "${SUI_DOWNLOAD_RATE:-}" ]; then
+    DOWNLOAD_RATE="$SUI_DOWNLOAD_RATE"
+    DOWNLOAD_RATE_EXPLICIT=true
+fi
 if [ -n "${SUI_LOW_MEM:-}" ]; then LOW_MEM="$SUI_LOW_MEM"; fi
 if [ -n "${SUI_SHA256:-}" ]; then EXPECTED_SHA256="$SUI_SHA256"; fi
 
@@ -139,7 +152,7 @@ while [ $# -gt 0 ]; do
         --arch)        ARCH="$2"; shift 2 ;;
         --install-dir) INSTALL_DIR="$2"; shift 2 ;;
         --version)     VERSION="$2"; shift 2 ;;
-        --download-rate) DOWNLOAD_RATE="$2"; shift 2 ;;
+        --download-rate) DOWNLOAD_RATE="$2"; DOWNLOAD_RATE_EXPLICIT=true; shift 2 ;;
         --low-mem)       LOW_MEM="$2"; shift 2 ;;
         --uninstall)   UNINSTALL=true; shift ;;
         --yes)         ASSUME="yes"; shift ;;
@@ -335,6 +348,54 @@ configure_memory_guard() {
     log_warn "On a 64 MiB host prefer --no-prompt and avoid opening extra SSH sessions"
 }
 
+# ── Choose the download rate ─────────────────────────────────────────────────
+# The download is the one step that can OOM a small box before the panel even
+# starts: at full speed the kernel fills page cache faster than it can reclaim
+# it, and the OOM killer picks the largest task -- often sshd rather than this
+# script. Offer that trade-off to a human, but never let an unattended run
+# choose "unlimited": --no-prompt's blanket "no" must not disable the guard.
+choose_download_rate() {
+    if $DOWNLOAD_RATE_EXPLICIT; then
+        if [ "$DOWNLOAD_RATE" = "0" ]; then
+            log_warn "Download rate cap disabled (--download-rate / SUI_DOWNLOAD_RATE)"
+        else
+            log_info "Download capped at $DOWNLOAD_RATE (--download-rate / SUI_DOWNLOAD_RATE)"
+        fi
+        return 0
+    fi
+
+    # --yes / --no-prompt and curl | sh all mean "do not ask". They keep the
+    # default cap instead of turning the question into an accidental "yes" or
+    # "no" that nobody read.
+    if [ -n "$ASSUME" ] || [ ! -t 0 ]; then
+        log_info "Download capped at $DOWNLOAD_RATE (default; --download-rate 0 for no cap)"
+        return 0
+    fi
+
+    printf "\n"
+    printf "Download speed: the sui binary is ~106 MiB.\n"
+    printf "At full speed the kernel fills the page cache faster than a small\n"
+    printf "host can reclaim it. On a <=256 MiB cgroup that can trigger an OOM\n"
+    printf "kill -- sometimes killing sshd instead of this installer.\n"
+    printf "On a host with plenty of RAM, answering n is fine.\n"
+    if [ -n "$MEM_LIMIT_BYTES" ]; then
+        printf "This host reports a %s MiB cgroup limit; limiting is recommended.\n" \
+            "$(( MEM_LIMIT_BYTES / 1048576 ))"
+    fi
+    printf "\n"
+    printf "Cap the download at %s/s? [Y/n]: " "$DOWNLOAD_RATE"
+    read -r _ans || true
+    case "$_ans" in
+        n|N|no|NO)
+            DOWNLOAD_RATE=0
+            log_warn "Rate cap disabled; full speed may OOM a small host"
+            ;;
+        *)
+            log_info "Download capped at $DOWNLOAD_RATE/s"
+            ;;
+    esac
+}
+
 # ── Check dependencies ────────────────────────────────────────────────────────
 check_deps() {
     # Only curl and openssl are needed: curl handles the release API, the
@@ -486,25 +547,41 @@ verify_binary() {
 # The body is NEVER captured in a shell variable -- on a 64 MiB cgroup that
 # alone is fatal. -C - resumes after an OOM-killed curl; --limit-rate caps how
 # fast page cache can grow; --speed-time/--speed-limit abort a dead connection.
+# On a terminal curl draws its own progress bar; when stderr is redirected
+# (cron, CI, 2>file) the meter is suppressed so logs stay readable.
 download_binary() {
     _url="$1"; _dest="$2"
     _part="$_dest.part"
     _log="$_dest.part.log"
     _i=0
+    # Built once: either empty or exactly two safe, literal words. The word
+    # splitting at the curl call sites is intentional.
+    if [ "$DOWNLOAD_RATE" = "0" ]; then
+        _rate_args=""
+    else
+        _rate_args="--limit-rate $DOWNLOAD_RATE"
+    fi
     while [ "$_i" -lt "$DOWNLOAD_RETRIES" ]; do
         _i=$(( _i + 1 ))
-        # Word-splitting of $_rate_args is intentional: it is either empty or
-        # exactly two safe, literal words produced by this script.
         if [ "$DOWNLOAD_RATE" = "0" ]; then
-            _rate_args=""
             log_info "Downloading (attempt $_i/$DOWNLOAD_RETRIES, no rate cap)"
         else
-            _rate_args="--limit-rate $DOWNLOAD_RATE"
             log_info "Downloading (attempt $_i/$DOWNLOAD_RETRIES, capped at $DOWNLOAD_RATE)"
         fi
-        if curl -fL $_rate_args -C - \
+        _rc=0
+        if [ -t 2 ]; then
+            # --progress-bar writes to stderr, so stderr has to stay on the
+            # terminal; curl's error text is then visible there too.
+            curl -fL $_rate_args --progress-bar -C - \
                 --connect-timeout 20 --speed-time 60 --speed-limit 1024 \
-                --max-time 3600 -o "$_part" "$_url" 2>"$_log"; then
+                --max-time 3600 -o "$_part" "$_url" || _rc=$?
+        else
+            # -sS: no progress meter in a log or pipe, but errors still print.
+            curl -fsSL $_rate_args -C - \
+                --connect-timeout 20 --speed-time 60 --speed-limit 1024 \
+                --max-time 3600 -o "$_part" "$_url" 2>"$_log" || _rc=$?
+        fi
+        if [ "$_rc" -eq 0 ]; then
             if verify_binary "$_part"; then
                 mv -f "$_part" "$_dest"
                 rm -f "$_log"
@@ -515,10 +592,10 @@ download_binary() {
             log_warn "Verification failed; discarding the partial file"
             rm -f "$_part"
         else
-            log_warn "Download attempt $_i failed"
+            log_warn "Download attempt $_i failed (curl exit $_rc)"
             # curl error 33 == server does not support byte ranges. A resumed
             # transfer can then never complete, so restart from zero once.
-            if grep -q -e "byte ranges" -e "error 33" "$_log" 2>/dev/null; then
+            if [ "$_rc" -eq 33 ]; then
                 rm -f "$_part"
             fi
         fi
@@ -1357,6 +1434,7 @@ main() {
 
     detect_arch
     configure_memory_guard
+    choose_download_rate
     check_deps
     get_version
     download_files
