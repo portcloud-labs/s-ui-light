@@ -1059,7 +1059,7 @@ panel_save() {
         --data-urlencode "initUsers=" || true
 }
 
-# ── Keep panel and subscription transports in sync ──────────────────────────
+# ── Panel HTTPS with client-compatible HTTP subscriptions ──────────────────────────
 # Probe before login so rerunning the installer also works on HTTPS installs.
 detect_panel_transport() {
     for _scheme_probe in https http; do
@@ -1094,8 +1094,8 @@ configure_web_transport() {
     fi
     _transport_payload=$(printf '%s' "$_transport_settings" | jq -c \
         --arg cert "$_transport_cert" --arg key "$_transport_key" --arg scheme "$_web_scheme" '
-        {webCertFile:$cert,webKeyFile:$key,subCertFile:$cert,subKeyFile:$key,
-         subURI:((.subURI // "") | sub("^https?://"; $scheme + "://")),
+        {webCertFile:$cert,webKeyFile:$key,subCertFile:"",subKeyFile:"",
+         subURI:((.subURI // "") | sub("^https?://"; "http://")),
          webURI:((.webURI // "") | sub("^https?://"; $scheme + "://"))}') || return 1
     _out=$(panel_save settings "" "$_transport_payload")
     printf '%s' "$_out" | jq -e '.success == true' >/dev/null || return 1
@@ -1112,13 +1112,13 @@ configure_web_transport() {
             # HTTPS back to HTTP in the same script session.
             _transport_effective=$(printf '%s' "$_transport_settings" | jq -c --argjson changes "$_transport_payload" '. + $changes') || return 1
             read_subscription_address "$_transport_effective"
-            log_info "Panel and subscriptions both use $_web_scheme"
+            log_info "Panel uses $_web_scheme; subscriptions use http"
             return 0
         fi
         _transport_attempt=$(( _transport_attempt + 1 ))
         sleep 1
     done
-    log_error "Could not verify both panel and subscription listeners over $_web_scheme"
+    log_error "Could not verify panel $_web_scheme and subscription HTTP listeners"
     return 1
 }
 
@@ -1136,15 +1136,16 @@ verify_web_transport() {
         "$_web_scheme://$_transport_panel_host:$PANEL_PORT/" 2>/dev/null || return 1
     curl -q -sk --noproxy '*' --connect-timeout 1 --max-time 2 -o /dev/null \
         -H "Host: ${_transport_sub_domain:-localhost}" \
-        "$_web_scheme://$_transport_sub_host:$_transport_sub_port/" 2>/dev/null || return 1
+        "http://$_transport_sub_host:$_transport_sub_port/" 2>/dev/null || return 1
     if [ "$_web_scheme" = http ]; then
         # A TLS listener may redirect plaintext HTTP; wait until TLS really is
         # off, so a restart in progress cannot masquerade as an HTTP listener.
         if curl -q -sk --noproxy '*' --connect-timeout 1 --max-time 2 -o /dev/null \
             "https://$_transport_panel_host:$PANEL_PORT/" 2>/dev/null; then return 1; fi
-        if curl -q -sk --noproxy '*' --connect-timeout 1 --max-time 2 -o /dev/null \
-            "https://$_transport_sub_host:$_transport_sub_port/" 2>/dev/null; then return 1; fi
     fi
+    # Subscriptions must really be HTTP, even while the panel uses HTTPS.
+    if curl -q -sk --noproxy '*' --connect-timeout 1 --max-time 2 -o /dev/null \
+        "https://$_transport_sub_host:$_transport_sub_port/" 2>/dev/null; then return 1; fi
     return 0
 }
 
@@ -2017,9 +2018,9 @@ main() {
     #    fix and is not made optional.
     set_admin_password
 
-    # 2. One choice configures both web listeners, including on repeat installs.
+    # 2. Panel TLS is optional; subscription TLS is cleared on repeat installs too.
     detect_panel_transport || { log_error "Could not reach the panel"; return 1; }
-    if ask "Enable HTTPS for BOTH panel and subscriptions? STRONGLY RECOMMENDED (self-signed certificate)"; then
+    if ask "Enable HTTPS for the PANEL? STRONGLY RECOMMENDED (self-signed certificate; subscriptions stay HTTP)"; then
         generate_cert || { log_error "Could not generate the HTTPS certificate"; return 1; }
         panel_login || return 1
         configure_web_transport https || return 1

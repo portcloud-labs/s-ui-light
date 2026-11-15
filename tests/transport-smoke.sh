@@ -11,19 +11,20 @@ PANEL_PORT=2095
 PANEL_PATH=/app/
 CERT_CRT='/test/self.crt'
 CERT_KEY='/test/self.key'
-panel_request() { printf '%s' '{"success":true,"obj":{"subPort":"2096","subURI":"http://sub.example/feed/","webURI":"http://panel.example/"}}'; }
+panel_request() { printf '%s' '{"success":true,"obj":{"subPort":"2096","subURI":"https://sub.example/feed/","subCertFile":"old.crt","subKeyFile":"old.key","webURI":"http://panel.example/"}}'; }
 panel_save() { printf '%s' "$3" > "$_TMP/settings"; printf '%s' '{"success":true}'; }
 service_restart() { echo restart >> "$_TMP/restarts"; }
 curl() {
     printf '%s\n' "$*" >> "$_TMP/requests"
+    case "$*" in *https://127.0.0.1:2096/*) return 35 ;; esac
     if [ "$_web_scheme" = http ]; then case "$*" in *https://*) return 35 ;; esac; fi
     return 0
 }
 configure_web_transport https >/dev/null
 $PANEL_TLS
-jq -e '.webCertFile == "/test/self.crt" and .webKeyFile == "/test/self.key" and .subCertFile == .webCertFile and .subKeyFile == .webKeyFile and .subURI == "https://sub.example/feed/" and .webURI == "https://panel.example/"' "$_TMP/settings" >/dev/null
+jq -e '.webCertFile == "/test/self.crt" and .webKeyFile == "/test/self.key" and .subCertFile == "" and .subKeyFile == "" and .subURI == "http://sub.example/feed/" and .webURI == "https://panel.example/"' "$_TMP/settings" >/dev/null
 grep -F 'https://127.0.0.1:2095/' "$_TMP/requests" >/dev/null
-grep -F 'https://127.0.0.1:2096/' "$_TMP/requests" >/dev/null
+grep -F 'http://127.0.0.1:2096/' "$_TMP/requests" >/dev/null
 configure_web_transport http >/dev/null
 ! $PANEL_TLS
 jq -e '.webCertFile == "" and .webKeyFile == "" and .subCertFile == "" and .subKeyFile == "" and .subURI == "http://sub.example/feed/"' "$_TMP/settings" >/dev/null
@@ -40,5 +41,5 @@ detect_panel_transport
 curl() { return 1; }
 sleep() { :; }
 if configure_web_transport https >"$_TMP/failed"; then exit 1; fi
-! grep -F 'both use https' "$_TMP/failed" >/dev/null
-echo 'Paired HTTP/HTTPS certificate settings, URL schemes, listener probes and failure handling passed'
+! grep -F 'subscriptions use http' "$_TMP/failed" >/dev/null
+echo 'Panel HTTPS/HTTP, subscription HTTP migration, URL schemes and listener failures passed'
