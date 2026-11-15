@@ -1059,49 +1059,93 @@ panel_save() {
         --data-urlencode "initUsers=" || true
 }
 
-# ── Enable HTTPS on the panel ────────────────────────────────────────────────
-# s-ui reads webCertFile/webKeyFile from its settings at startup, so the panel
-# has to be restarted for the change to take effect.
-enable_panel_tls() {
-    log_info "Enabling HTTPS for the panel..."
-    # The settings branch of the panel's save ignores the action, so it is left
-    # empty; certFile and keyFile must both be set or the panel refuses to start.
-    _out=$(panel_save settings "" "{\"webCertFile\":\"$CERT_CRT\",\"webKeyFile\":\"$CERT_KEY\"}")
-    case "$_out" in
-        *'"success":true'*) ;;
-        *)
-            log_error "Failed to enable HTTPS"
-            return 1
-            ;;
-    esac
+# ── Keep panel and subscription transports in sync ──────────────────────────
+# Probe before login so rerunning the installer also works on HTTPS installs.
+detect_panel_transport() {
+    for _scheme_probe in https http; do
+        _probe=$(curl -sk --connect-timeout 1 --max-time 3 \
+            -H 'X-Requested-With: XMLHttpRequest' \
+            "$_scheme_probe://127.0.0.1:$PANEL_PORT${PANEL_PATH}api/status" 2>/dev/null) || continue
+        if printf '%s' "$_probe" | jq -e 'has("success")' >/dev/null 2>&1; then
+            API_BASE="$_scheme_probe://127.0.0.1:$PANEL_PORT${PANEL_PATH}api/"
+            PANEL_TLS=false
+            [ "$_scheme_probe" != https ] || PANEL_TLS=true
+            return 0
+        fi
+    done
+    return 1
+}
 
-    # The setting is committed before the restart, so the panel is on HTTPS
-    # from here on whether or not the switch below succeeds. PANEL_TLS is
-    # therefore set from what the panel actually serves, not from the intent --
-    # a failed switch must not leave the summary advertising http:// for a
-    # panel that now refuses it.
-    _http_base="http://127.0.0.1:$PANEL_PORT${PANEL_PATH}api/"
-    API_BASE="https://127.0.0.1:$PANEL_PORT${PANEL_PATH}api/"
-    service_restart
-    sleep 3
-
-    _i=0
-    while [ "$_i" -lt 10 ]; do
-        _out=$(panel_request GET "status" || true)
-        case "$_out" in
-            # Any JSON at all means the TLS listener accepted the request.
-            *'"success"'*) PANEL_TLS=true; return 0 ;;
-        esac
-        _i=$(( _i + 1 ))
+configure_web_transport() {
+    _web_scheme="$1"
+    case "$_web_scheme" in https|http) ;; *) return 1 ;; esac
+    _transport_response=$(panel_request GET settings) || return 1
+    _transport_settings=$(printf '%s' "$_transport_response" | jq -ce 'select(.success == true) | .obj') || return 1
+    _transport_sub_port=$(printf '%s' "$_transport_settings" | jq -r '.subPort // "2096"')
+    _transport_sub_listen=$(printf '%s' "$_transport_settings" | jq -r '.subListen // empty')
+    _transport_web_listen=$(printf '%s' "$_transport_settings" | jq -r '.webListen // empty')
+    _transport_sub_domain=$(printf '%s' "$_transport_settings" | jq -r '.subDomain // empty')
+    _transport_web_domain=$(printf '%s' "$_transport_settings" | jq -r '.webDomain // empty')
+    if [ "$_web_scheme" = https ]; then
+        [ -n "$CERT_CRT" ] && [ -n "$CERT_KEY" ] || return 1
+        _transport_cert="$CERT_CRT"; _transport_key="$CERT_KEY"
+    else
+        _transport_cert=""; _transport_key=""
+    fi
+    _transport_payload=$(printf '%s' "$_transport_settings" | jq -c \
+        --arg cert "$_transport_cert" --arg key "$_transport_key" --arg scheme "$_web_scheme" '
+        {webCertFile:$cert,webKeyFile:$key,subCertFile:$cert,subKeyFile:$key,
+         subURI:((.subURI // "") | sub("^https?://"; $scheme + "://")),
+         webURI:((.webURI // "") | sub("^https?://"; $scheme + "://"))}') || return 1
+    _out=$(panel_save settings "" "$_transport_payload")
+    printf '%s' "$_out" | jq -e '.success == true' >/dev/null || return 1
+    # The four certificate fields are saved in one transaction, then both
+    # listeners are restarted together. Never advertise an unverified scheme.
+    service_restart || return 1
+    API_BASE="$_web_scheme://127.0.0.1:$PANEL_PORT${PANEL_PATH}api/"
+    _transport_attempt=0
+    while [ "$_transport_attempt" -lt 10 ]; do
+        if verify_web_transport; then
+            PANEL_TLS=false
+            [ "$_web_scheme" != https ] || PANEL_TLS=true
+            # Refresh the summary even when switching an existing client from
+            # HTTPS back to HTTP in the same script session.
+            _transport_effective=$(printf '%s' "$_transport_settings" | jq -c --argjson changes "$_transport_payload" '. + $changes') || return 1
+            read_subscription_address "$_transport_effective"
+            log_info "Panel and subscriptions both use $_web_scheme"
+            return 0
+        fi
+        _transport_attempt=$(( _transport_attempt + 1 ))
         sleep 1
     done
-
-    # Not answering over HTTPS. Fall back so the remaining steps can still run,
-    # and say so plainly rather than reporting a switch that did not take.
-    log_warn "The panel is not answering over HTTPS; falling back to HTTP"
-    API_BASE="$_http_base"
-    PANEL_TLS=false
+    log_error "Could not verify both panel and subscription listeners over $_web_scheme"
     return 1
+}
+
+verify_web_transport() {
+    _transport_panel_host="$_transport_web_listen"
+    _transport_sub_host="$_transport_sub_listen"
+    case "$_transport_panel_host" in ''|0.0.0.0|::) _transport_panel_host=127.0.0.1 ;; esac
+    case "$_transport_sub_host" in ''|0.0.0.0|::) _transport_sub_host=127.0.0.1 ;; esac
+    case "$_transport_panel_host" in *:*) _transport_panel_host="[$_transport_panel_host]" ;; esac
+    case "$_transport_sub_host" in *:*) _transport_sub_host="[$_transport_sub_host]" ;; esac
+    # Any HTTP response proves a listener exists; even a Host rejection/404 is
+    # sufficient here. HTTPS must complete its TLS handshake, not just redirect.
+    curl -q -sk --noproxy '*' --connect-timeout 1 --max-time 2 -o /dev/null \
+        -H "Host: ${_transport_web_domain:-localhost}" \
+        "$_web_scheme://$_transport_panel_host:$PANEL_PORT/" 2>/dev/null || return 1
+    curl -q -sk --noproxy '*' --connect-timeout 1 --max-time 2 -o /dev/null \
+        -H "Host: ${_transport_sub_domain:-localhost}" \
+        "$_web_scheme://$_transport_sub_host:$_transport_sub_port/" 2>/dev/null || return 1
+    if [ "$_web_scheme" = http ]; then
+        # A TLS listener may redirect plaintext HTTP; wait until TLS really is
+        # off, so a restart in progress cannot masquerade as an HTTP listener.
+        if curl -q -sk --noproxy '*' --connect-timeout 1 --max-time 2 -o /dev/null \
+            "https://$_transport_panel_host:$PANEL_PORT/" 2>/dev/null; then return 1; fi
+        if curl -q -sk --noproxy '*' --connect-timeout 1 --max-time 2 -o /dev/null \
+            "https://$_transport_sub_host:$_transport_sub_port/" 2>/dev/null; then return 1; fi
+    fi
+    return 0
 }
 
 # ── Pick a random decoy SNI ──────────────────────────────────────────────────
@@ -1480,7 +1524,7 @@ lookup_node_label() {
         select(.country_code | type == "string" and test("^[A-Z]{2}$")) |
         select(.country | type == "string" and length > 0 and length < 80 and (test("[\\u0000-\\u001f]") | not)) |
         select(.flag.emoji | type == "string" and length == 2) |
-        "\(.flag.emoji) \(.country)节点"' 2>/dev/null) || return 0
+        "\(.flag.emoji)\(.country)节点"' 2>/dev/null) || return 0
     NODE_LABEL="$_label"
 }
 
@@ -1725,22 +1769,41 @@ create_subscription_client() {
     [ ${#_client_name} -eq 24 ] && [ ${#_client_pass} -eq 24 ] && [ ${#_uuid_hex} -eq 32 ] || return 1
     _client_uuid=$(printf '%s' "$_uuid_hex" | sed 's/^\(........\)\(....\).\(...\).\(...\)\(............\)$/\1-\2-4\3-8\4-\5/')
 
-    # Empty published addresses otherwise inherit the loopback API hostname.
-    # Keep existing explicit addresses, including custom NAT/CDN port mappings.
-    if [ -n "$SUB_PUBLIC_HOST" ]; then
-        _empty_ids=$(printf '%s' "$_inbounds" | jq -r '.[] | select((.addrs // []) | length == 0) | .id')
-        for _inbound_id in $_empty_ids; do
-            _updated_inbound=$(printf '%s' "$_inbounds" | jq -c --argjson id "$_inbound_id" --arg host "$SUB_PUBLIC_HOST" '
-                .[] | select(.id == $id) | .addrs = [{server:$host, server_port:.listen_port, remark:""}]') || return 1
-            _saved=$(panel_save inbounds edit "$_updated_inbound")
-            printf '%s' "$_saved" | jq -e '.success == true' >/dev/null || return 1
-        done
+    # Use the inbound tag itself for the display name: s-ui inserts a hyphen
+    # between client remark and tag, so a client prefix cannot produce the
+    # requested compact name exactly. Full objects preserve credentials/TLS.
+    _named_inbounds=$(printf '%s' "$_inbounds" | jq -c --arg label "$NODE_LABEL" --arg host "$SUB_PUBLIC_HOST" '
+        sort_by(.id) | reduce .[] as $inb ({counts:{},items:[]};
+            ($inb.type) as $type |
+            (.counts[$type] // 0) as $count |
+            .counts[$type] = ($count + 1) |
+            ({hysteria2:"Hy2",vless:"VLESS",vmess:"VMess",trojan:"Trojan",tuic:"TUIC",
+              shadowsocks:"SS",anytls:"AnyTLS",hysteria:"Hy",socks:"SOCKS",http:"HTTP",mixed:"Mixed"}[$type] // $type) as $protocol |
+            .items += [($inb |
+                if $host != "" and ((.addrs // [])|length) == 0
+                then .addrs = [{server:$host, server_port:.listen_port, remark:""}] else . end |
+                .tag = ($label + (if ((.addrs[0].server // $host)|contains(":")) then " v6" else "" end) + " · " + $protocol +
+                    (if $count == 0 then "" else " " + (($count + 1)|tostring) end)))]
+        ) | .items') || return 1
+    for _inbound_id in $(printf '%s' "$_named_inbounds" | jq -r '.[].id'); do
+        _updated_inbound=$(printf '%s' "$_named_inbounds" | jq -c --argjson id "$_inbound_id" '.[] | select(.id == $id)') || return 1
+        _saved=$(panel_save inbounds edit "$_updated_inbound")
+        printf '%s' "$_saved" | jq -e '.success == true' >/dev/null || return 1
+    done
+    # Keep this run's node summary paired with its own port after renaming.
+    _hy2_id=$(printf '%s' "$_inbounds" | jq -r --arg tag "${HY2_TAG:-}" '.[] | select(.tag == $tag) | .id' | head -1)
+    _vless_id=$(printf '%s' "$_inbounds" | jq -r --arg tag "${VLESS_TAG:-}" '.[] | select(.tag == $tag) | .id' | head -1)
+    if [ -n "$_hy2_id" ]; then
+        HY2_TAG=$(printf '%s' "$_named_inbounds" | jq -r --argjson id "$_hy2_id" '.[] | select(.id == $id) | .tag')
+    fi
+    if [ -n "$_vless_id" ]; then
+        VLESS_TAG=$(printf '%s' "$_named_inbounds" | jq -r --argjson id "$_vless_id" '.[] | select(.id == $id) | .tag')
     fi
 
     _client_json=$(printf '%s' "$_inbounds" | jq -c \
         --arg name "$_client_name" --arg pass "$_client_pass" --arg uuid "$_client_uuid" \
-        --arg ss16 "$_ss16" --arg ss32 "$_ss32" --arg label "$NODE_LABEL · " '
-        {enable:true, name:$name, remark:$label, volume:0, expiry:0,
+        --arg ss16 "$_ss16" --arg ss32 "$_ss32" '
+        {enable:true, name:$name, remark:"", volume:0, expiry:0,
          inbounds:map(.id), links:[], config:{
             vless:{name:$name,uuid:$uuid,flow:"xtls-rprx-vision"},
             vmess:{name:$name,uuid:$uuid,alterId:0},
@@ -1954,22 +2017,15 @@ main() {
     #    fix and is not made optional.
     set_admin_password
 
-    # 2. Offer TLS for the panel itself.
-    if ask "Serve the s-ui panel over HTTPS with a self-signed certificate?"; then
-        if generate_cert; then
-            if panel_login; then
-                enable_panel_tls || log_warn "The panel did not come up on HTTPS"
-                # The cookie was issued over HTTP; HTTPS logins are re-issued
-                # per request by the panel, so reuse it instead of logging in
-                # again over a certificate curl would have to be told to trust.
-            else
-                log_warn "Could not log in to the panel; skipping HTTPS"
-            fi
-        else
-            log_warn "Skipping HTTPS"
-        fi
+    # 2. One choice configures both web listeners, including on repeat installs.
+    detect_panel_transport || { log_error "Could not reach the panel"; return 1; }
+    if ask "Enable HTTPS for BOTH panel and subscriptions? STRONGLY RECOMMENDED (self-signed certificate)"; then
+        generate_cert || { log_error "Could not generate the HTTPS certificate"; return 1; }
+        panel_login || return 1
+        configure_web_transport https || return 1
     else
-        log_info "Panel will keep serving HTTP"
+        panel_login || return 1
+        configure_web_transport http || return 1
     fi
 
     # 3. Offer a Hysteria2 node. The certificate from step 2 is reused when it

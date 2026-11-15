@@ -33,7 +33,7 @@ discover_public_addresses
 SUB_PUBLIC_HOST=8.8.8.8
 curl() { echo '{"success":true,"ip":"8.8.8.8","country":"美国","country_code":"US","flag":{"emoji":"🇺🇸"}}'; }
 lookup_node_label
-[ "$NODE_LABEL" = '🇺🇸 美国节点' ]
+[ "$NODE_LABEL" = '🇺🇸美国节点' ]
 curl() { echo '{"success":false,"country":"美国"}'; }
 lookup_node_label
 [ "$NODE_LABEL" = '🚀 加速节点' ]
@@ -83,11 +83,16 @@ panel_request() {
 panel_save() {
     case "$1" in
         inbounds)
-            printf '%s' "$3" | jq -e '.id == 2 and .tls_id == 7 and .transport.path == "/keep" and .addrs[0].server == "8.8.8.8" and .addrs[0].server_port == 443' >/dev/null || return 1
+            printf '%s' "$3" | jq -e '
+                if .id == 1 then
+                    .obfs.password == "keep-me" and .addrs[0].server == "nat.example" and .addrs[0].server_port == 30001 and (.tag|endswith("Hy2"))
+                else
+                    .id == 2 and .tls_id == 7 and .transport.path == "/keep" and .addrs[0].server == "8.8.8.8" and .addrs[0].server_port == 443 and (.tag|endswith("VLESS"))
+                end' >/dev/null || return 1
             printf '%s' "$3" > "$_TMP_TEST/inbound-edit"
             ;;
         clients)
-            printf '%s' "$3" | jq -e '.inbounds == [1,2] and .enable == true and .volume == 0 and .expiry == 0 and (.name|length == 24) and (.config.hysteria2.password|length == 24) and (.config.vless.uuid|test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$"))' >/dev/null || return 1
+            printf '%s' "$3" | jq -e '.remark == "" and .inbounds == [1,2] and .enable == true and .volume == 0 and .expiry == 0 and (.name|length == 24) and (.config.hysteria2.password|length == 24) and (.config.vless.uuid|test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$"))' >/dev/null || return 1
             ;;
         settings)
             printf '%s' "$3" | jq -e '.subClashNoDefGrp == "true" and .subClashSprtAll == "true" and (.subClashExt|contains("proxy-groups:"))' >/dev/null || return 1
