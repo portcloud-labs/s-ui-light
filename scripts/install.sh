@@ -6,8 +6,8 @@
 # architecture. Downloads binaries from GitHub Releases (no git needed).
 #
 # The binary is ~100 MiB but the target VPS may have a 64 MiB cgroup hard
-# limit. The download is therefore rate-limited by default (1M/s), resumable,
-# streamed straight to disk, shown with a progress bar on a terminal, and
+# limit. Downloads default to a 1M/s cap below 96 MiB, and no cap otherwise.
+# They are resumable, streamed to disk, shown with a progress bar on a terminal, and
 # verified before it is ever executed. The operator can switch the cap off at
 # the prompt or with --download-rate 0. On small-memory hosts the Go runtime
 # also gets a soft heap limit, so the kernel does not OOM-kill the panel (or
@@ -16,6 +16,7 @@
 # After installing, the script optionally:
 #   - sets a random strong password for the admin account (username unchanged)
 #   - generates a self-signed certificate and serves the panel over HTTPS
+#   - creates an unlimited client for all current inbounds and applies a Clash template
 #   - deploys a Hysteria2 inbound with a self-signed certificate, a forged SNI
 #     and "allow insecure" enabled, plus Salamander with a separate random password
 #
@@ -27,12 +28,12 @@
 #   --arch <arch>            Force architecture (amd64|arm64). Auto-detected by default.
 #   --install-dir <dir>      Installation directory. Default: /usr/local/s-ui
 #   --version <ver>          Specific version to install (default: latest)
-#   --download-rate <rate>   Cap the binary download (default: 1M; 0 = no cap).
+#   --download-rate <rate>   Cap the download (default: 1M below 96 MiB, otherwise 0).
 #                            Skips the interactive rate question.
 #   --low-mem <auto|on|off>  Go memory guard (default: auto, enabled at <=256 MiB cgroup)
 #   --uninstall              Remove s-ui and its service
 #   --no-prompt              Skip every interactive question. Post-install steps
-#                            stay off; the download cap stays on (1M/s)
+#                            stay off; the download cap follows detected memory
 #   --yes                    Skip every interactive question (answer "yes" to each)
 #   --no-stats               Do not report this run to the public install counter
 #   -h, --help               Show this help
@@ -103,6 +104,10 @@ ADMIN_PASS=""
 CERT_CRT=""
 CERT_KEY=""
 PANEL_TLS=false
+PUBLIC_IPS_READY=false
+PUBLIC_IPV4=""
+PUBLIC_IPV6=""
+SUB_CLIENT_NAME=""
 NO_STATS=false
 
 # ── Low-memory / download defaults ───────────────────────────────────────────
@@ -111,11 +116,9 @@ NO_STATS=false
 # binary with wget is impossible without installing GNU wget, and `apk add` is
 # itself one of the first things to OOM on a 64 MiB box.
 #
-# 1M is the default because 512K made a normal install feel broken on a fast
-# link, while unlimited still fills a 64 MiB box's page cache faster than the
-# kernel can reclaim it. choose_download_rate() lets the operator turn the cap
-# off after reading that trade-off.
-DOWNLOAD_RATE="1M"          # curl --limit-rate: 1 MiB/s is ~106 s for 106 MiB
+# Offer a 1M/s cap below 96 MiB; larger hosts default to unlimited.
+# Keep the cap if memory cannot be detected. Explicit settings always win.
+DOWNLOAD_RATE="1M"
 DOWNLOAD_RATE_EXPLICIT=false  # set by --download-rate / SUI_DOWNLOAD_RATE
 DOWNLOAD_RETRIES=5
 LOW_MEM="auto"              # auto | on | off
@@ -187,7 +190,7 @@ case "$LOW_MEM" in
 esac
 case "$DOWNLOAD_RATE" in
     0)
-        log_warn "Download rate cap disabled (0); not recommended on small-memory hosts"
+        log_warn "Download rate cap disabled (0)"
         ;;
     # curl accepts <number>[K|M|G] (also lowercase). Require that exact shape:
     # 'K512' or an empty suffix would otherwise reach curl as a bad flag.
@@ -349,72 +352,92 @@ configure_memory_guard() {
 }
 
 # ── Choose the download rate ─────────────────────────────────────────────────
-# The download is the one step that can OOM a small box before the panel even
-# starts: at full speed the kernel fills page cache faster than it can reclaim
-# it, and the OOM killer picks the largest task -- often sshd rather than this
-# script. Offer that trade-off to a human, but never let an unattended run
-# choose "unlimited": --no-prompt's blanket "no" must not disable the guard.
+# Use the cgroup limit when available; otherwise read physical RAM for hosts
+# without a cgroup cap. This fallback only affects downloads, not the Go guard.
 choose_download_rate() {
     if $DOWNLOAD_RATE_EXPLICIT; then
         if [ "$DOWNLOAD_RATE" = "0" ]; then
-            log_warn "Download rate cap disabled (--download-rate / SUI_DOWNLOAD_RATE)"
+            log_info "Download rate cap disabled (--download-rate / SUI_DOWNLOAD_RATE)"
         else
             log_info "Download capped at $DOWNLOAD_RATE (--download-rate / SUI_DOWNLOAD_RATE)"
         fi
         return 0
     fi
 
-    # --yes / --no-prompt and curl | sh all mean "do not ask". They keep the
-    # default cap instead of turning the question into an accidental "yes" or
-    # "no" that nobody read.
+    _download_mem_bytes="$MEM_LIMIT_BYTES"
+    _download_mem_source="cgroup limit"
+    if [ -z "$_download_mem_bytes" ]; then
+        _download_mem_bytes=$(awk '/^MemTotal:/ { printf "%.0f\n", $2 * 1024; exit }' /proc/meminfo 2>/dev/null || true)
+        _download_mem_source="physical RAM"
+    fi
+    case "$_download_mem_bytes" in
+        ''|*[!0-9]*|0) _download_mem_bytes="" ;;
+    esac
+
+    _cap_default=y
+    if [ -n "$_download_mem_bytes" ] && [ "$_download_mem_bytes" -ge 100663296 ]; then
+        _cap_default=n
+    fi
+
+    # Unattended installs use the same memory-based default as the prompt.
     if [ -n "$ASSUME" ] || [ ! -t 0 ]; then
-        log_info "Download capped at $DOWNLOAD_RATE (default; --download-rate 0 for no cap)"
+        if [ "$_cap_default" = n ]; then
+            DOWNLOAD_RATE=0
+            log_info "Download rate cap disabled (default; detected memory >=96 MiB)"
+        else
+            log_info "Download capped at $DOWNLOAD_RATE (default; memory <96 MiB or unknown)"
+        fi
         return 0
     fi
 
-    printf "\n"
-    printf "Download speed: the sui binary is ~106 MiB.\n"
-    printf "At full speed the kernel fills the page cache faster than a small\n"
-    printf "host can reclaim it. On a <=256 MiB cgroup that can trigger an OOM\n"
-    printf "kill -- sometimes killing sshd instead of this installer.\n"
-    printf "On a host with plenty of RAM, answering n is fine.\n"
-    if [ -n "$MEM_LIMIT_BYTES" ]; then
-        printf "This host reports a %s MiB cgroup limit; limiting is recommended.\n" \
-            "$(( MEM_LIMIT_BYTES / 1048576 ))"
+    printf "\nDownload speed: the sui binary is ~106 MiB.\n"
+    if [ -n "$_download_mem_bytes" ]; then
+        printf "Detected memory: %s MiB (%s).\n" \
+            "$(( _download_mem_bytes / 1048576 ))" "$_download_mem_source"
+    else
+        printf "Could not detect memory; keeping the cap enabled by default.\n"
     fi
-    printf "\n"
-    printf "Cap the download at %s/s? [Y/n]: " "$DOWNLOAD_RATE"
+    if [ "$_cap_default" = y ]; then
+        if [ -n "$_download_mem_bytes" ]; then
+            printf "Below 96 MiB, a download cap is recommended to reduce page-cache pressure and OOM risk.\n"
+        fi
+        _cap_choices="Y/n"
+    else
+        _cap_choices="y/N"
+    fi
+    printf "\nCap the download at %s/s? [%s]: " "$DOWNLOAD_RATE" "$_cap_choices"
     read -r _ans || true
     case "$_ans" in
-        n|N|no|NO)
-            DOWNLOAD_RATE=0
-            log_warn "Rate cap disabled; full speed may OOM a small host"
-            ;;
-        *)
-            log_info "Download capped at $DOWNLOAD_RATE/s"
-            ;;
+        y|Y|yes|YES) ;;
+        n|N|no|NO) DOWNLOAD_RATE=0 ;;
+        *) [ "$_cap_default" = y ] || DOWNLOAD_RATE=0 ;;
     esac
+    if [ "$DOWNLOAD_RATE" = 0 ]; then
+        log_info "Download rate cap disabled"
+    else
+        log_info "Download capped at $DOWNLOAD_RATE/s"
+    fi
 }
 
 # ── Check dependencies ────────────────────────────────────────────────────────
 check_deps() {
-    # Only curl and openssl are needed: curl handles the release API, the
-    # rate-limited binary download AND the panel API (busybox wget has neither
-    # a cookie jar nor --limit-rate). Dropping the wget check matters on a
-    # 64 MiB box, where `apk add` / `apt-get` is a memory-hungry step.
+    # curl downloads and calls the panel; openssl generates credentials/certs;
+    # jq safely handles full panel objects, TLS IDs and subscription settings.
     case "$OS" in
         alpine)
-            local need_openrc=false need_curl=false need_openssl=false
+            local need_openrc=false need_curl=false need_openssl=false need_jq=false
 
             command -v rc-service >/dev/null 2>&1 || command -v rc-update >/dev/null 2>&1 || need_openrc=true
             command -v curl >/dev/null 2>&1 || need_curl=true
             command -v openssl >/dev/null 2>&1 || need_openssl=true
+            command -v jq >/dev/null 2>&1 || need_jq=true
 
-            if $need_openrc || $need_curl || $need_openssl; then
+            if $need_openrc || $need_curl || $need_openssl || $need_jq; then
                 local packages=""
                 $need_openrc && packages="$packages openrc"
                 $need_curl && packages="$packages curl"
                 $need_openssl && packages="$packages openssl"
+                $need_jq && packages="$packages jq"
 
                 log_info "Installing missing dependencies:$packages"
                 if $LOW_MEM_ENABLED; then
@@ -429,15 +452,17 @@ check_deps() {
             fi
             ;;
         debian)
-            local need_curl=false need_openssl=false
+            local need_curl=false need_openssl=false need_jq=false
 
             command -v curl >/dev/null 2>&1 || need_curl=true
             command -v openssl >/dev/null 2>&1 || need_openssl=true
+            command -v jq >/dev/null 2>&1 || need_jq=true
 
-            if $need_curl || $need_openssl; then
+            if $need_curl || $need_openssl || $need_jq; then
                 local packages=""
                 $need_curl && packages="$packages curl"
                 $need_openssl && packages="$packages openssl"
+                $need_jq && packages="$packages jq"
 
                 log_info "Installing missing dependencies:$packages"
                 apt-get update -qq
@@ -1134,18 +1159,9 @@ deploy_hysteria2() {
             ;;
     esac
 
-    # The id of the record just created, taken from the first "id" *inside* the
-    # response's "tls" array. Truncating the line at the marker first matters:
-    # a greedy sed over the whole line returns the id belonging to whichever
-    # array happens to sort last, so a response ordered with "tls" before
-    # clients/inbounds yields the wrong row's id and binds the inbound to
-    # another TLS config, silently.
-    _tls_id=$(echo "$_out" | awk '{
-        i = index($0, "\"tls\":[")
-        if (i == 0) { exit }
-        rest = substr($0, i + 7)
-        if (match(rest, /"id"[ ]*:[ ]*[0-9]+/)) print substr(rest, RSTART, RLENGTH)
-    }' | sed 's/[^0-9]//g')
+    # The save returns every TLS object; select the newest record, not the
+    # first array entry (which may belong to another protocol or earlier run).
+    _tls_id=$(printf '%s' "$_out" | jq -er '.obj.tls | max_by(.id) | .id' 2>/dev/null) || return 1
 
     case "$_tls_id" in
         ''|*[!0-9]*)
@@ -1255,15 +1271,9 @@ deploy_vless_reality() {
             ;;
     esac
 
-    # The id of the record just created, taken from the first "id" *inside* the
-    # response's "tls" array. Same pattern as the hy2 deployment: a greedy sed
-    # would bind the inbound to whichever array happens to sort last.
-    _tls_id=$(echo "$_out" | awk '{
-        i = index($0, "\"tls\":[")
-        if (i == 0) { exit }
-        rest = substr($0, i + 7)
-        if (match(rest, /"id"[ ]*:[ ]*[0-9]+/)) print substr(rest, RSTART, RLENGTH)
-    }' | sed 's/[^0-9]//g')
+    # The save returns every TLS object; select the newest record, not the
+    # first array entry (which may belong to another protocol or earlier run).
+    _tls_id=$(printf '%s' "$_out" | jq -er '.obj.tls | max_by(.id) | .id' 2>/dev/null) || return 1
 
     case "$_tls_id" in
         ''|*[!0-9]*)
@@ -1322,20 +1332,493 @@ read_panel_address() {
     esac
 }
 
+# Normalize addresses for deduplication, including equivalent IPv6 spellings.
+# Reject error pages, malformed addresses, loopback and link-local addresses.
+# An optional family (4 or 6) restricts a public-IP response to that family.
+normalize_summary_addresses() {
+    awk -v family="${1:-}" -v public_only="${2:-false}" '
+    function ipv4(s, a, n, i, out) {
+        n = split(s, a, ".")
+        if (n != 4) return ""
+        out = ""
+        for (i = 1; i <= n; i++) {
+            if (a[i] !~ /^[0-9]+$/ || length(a[i]) > 3 || a[i] + 0 > 255) return ""
+            out = out (i > 1 ? "." : "") (a[i] + 0)
+        }
+        return out
+    }
+    function ipv6(s, a, halves, n, left, right, missing, i, part, out, v4, octets) {
+        s = tolower(s)
+        # Expand an IPv4 tail to two hextets before normalizing.
+        if (s ~ /\./) {
+            n = split(s, a, ":")
+            v4 = ipv4(a[n])
+            if (v4 == "") return ""
+            split(v4, octets, ".")
+            sub(/[^:]+$/, sprintf("%x:%x", octets[1]*256+octets[2], octets[3]*256+octets[4]), s)
+        }
+        if (s !~ /^[0-9a-f:]+$/) return ""
+        n = split(s, halves, "::")
+        if (n > 2) return ""
+        if (n == 2) {
+            left = halves[1] == "" ? 0 : split(halves[1], a, ":")
+            right = halves[2] == "" ? 0 : split(halves[2], a, ":")
+            missing = 8 - left - right
+            if (missing < 1) return ""
+            s = halves[1]
+            for (i = 0; i < missing; i++) s = s (s == "" ? "" : ":") "0"
+            if (right) s = s ":" halves[2]
+        }
+        n = split(s, a, ":")
+        if (n != 8) return ""
+        out = ""
+        for (i = 1; i <= n; i++) {
+            part = a[i]
+            if (part == "" || length(part) > 4) return ""
+            sub(/^0+/, "", part)
+            if (part == "") part = "0"
+            out = out (i > 1 ? ":" : "") part
+        }
+        return out
+    }
+    function public4(s, a) {
+        split(s, a, ".")
+        return !(a[1] == 0 || a[1] == 10 || a[1] == 127 || a[1] >= 224 ||
+            (a[1] == 100 && a[2] >= 64 && a[2] <= 127) ||
+            (a[1] == 169 && a[2] == 254) ||
+            (a[1] == 172 && a[2] >= 16 && a[2] <= 31) ||
+            (a[1] == 192 && (a[2] == 168 || (a[2] == 0 && (a[3] == 0 || a[3] == 2)) || (a[2] == 88 && a[3] == 99))) ||
+            (a[1] == 198 && (a[2] == 18 || a[2] == 19 || (a[2] == 51 && a[3] == 100))) ||
+            (a[1] == 203 && a[2] == 0 && a[3] == 113))
+    }
+    function public6(s, a) {
+        split(s, a, ":")
+        # Conservatively accept native global unicast only. Exclude special
+        # 2001::/23, documentation, deprecated 6to4 and reserved ranges.
+        return a[1] ~ /^[23][0-9a-f][0-9a-f][0-9a-f]$/ &&
+            !(a[1] == "2001" && (length(a[2]) < 3 || a[2] ~ /^1[0-9a-f][0-9a-f]$/ || a[2] == "db8")) &&
+            a[1] != "2002" && a[1] != "3fff"
+    }
+    {
+        for (field = 1; field <= NF; field++) {
+            addr = $field
+            if (index(addr, ":")) {
+                if (family == "4") continue
+                key = ipv6(addr)
+                if (key == "" || key == "0:0:0:0:0:0:0:0" || key == "0:0:0:0:0:0:0:1" || key ~ /^fe[89ab][0-9a-f]:/ || key ~ /^ff[0-9a-f][0-9a-f]:/) continue
+                if (public_only == "true" && !public6(key)) continue
+                host = "[" tolower(addr) "]"
+            } else {
+                if (family == "6") continue
+                key = ipv4(addr)
+                if (key == "" || key ~ /^(0|127)\./ || key ~ /^169\.254\./) continue
+                if (public_only == "true" && !public4(key)) continue
+                host = key
+            }
+            if (!seen[key]++) print host
+        }
+    }'
+}
+
+# Public addresses come first, followed by all interface addresses. Each probe
+# has a short timeout and discards even partial output on failure. No failures
+# are logged, and no extra dependencies are installed just to discover an IP.
+collect_summary_addresses() {
+    {
+        discover_public_addresses
+        printf '%s\n' "$PUBLIC_IPV4" "$PUBLIC_IPV6"
+        _interface_ips=$(ip -o addr show scope global 2>/dev/null | \
+            awk '$3 == "inet" || $3 == "inet6" { sub(/\/.*/, "", $4); print $4 }')
+        if [ -n "$_interface_ips" ]; then
+            printf '%s\n' "$_interface_ips"
+        else
+            hostname -I 2>/dev/null || true
+        fi
+    } | normalize_summary_addresses
+}
+
+# ── Optional ready-to-use Clash subscription ────────────────────────────────
+# Ensure jq is present when this helper is sourced independently for repair
+# or tests; the normal installer already installs it in check_deps().
+ensure_subscription_jq() {
+    command -v jq >/dev/null 2>&1 && return 0
+    log_info "Installing jq for subscription setup..."
+    case "$OS" in
+        alpine) apk add --no-cache jq || return 1 ;;
+        debian) apt-get update -qq && apt-get install -y -qq jq || return 1 ;;
+        *) return 1 ;;
+    esac
+    command -v jq >/dev/null 2>&1
+}
+
+discover_public_addresses() {
+    [ "${PUBLIC_IPS_READY:-false}" = true ] && return 0
+    PUBLIC_IPV4=$(curl -q -4 -fsS --noproxy '*' --connect-timeout 2 --max-time 4 \
+        --max-filesize 128 --retry 0 https://api.ipify.org 2>/dev/null) || PUBLIC_IPV4=""
+    PUBLIC_IPV4=$(printf '%s\n' "$PUBLIC_IPV4" | normalize_summary_addresses 4 true | head -1)
+    PUBLIC_IPV6=$(curl -q -6 -fsS --noproxy '*' --connect-timeout 2 --max-time 4 \
+        --max-filesize 128 --retry 0 https://api6.ipify.org 2>/dev/null) || PUBLIC_IPV6=""
+    PUBLIC_IPV6=$(printf '%s\n' "$PUBLIC_IPV6" | normalize_summary_addresses 6 true | head -1 | tr -d '[]')
+    PUBLIC_IPS_READY=true
+}
+
+# Lookup the chosen address, not the API connection's possibly different exit.
+# All failures (including HTTP 200 + success:false) keep the generic name.
+lookup_node_label() {
+    NODE_LABEL="🚀 加速节点"
+    [ -n "$SUB_PUBLIC_HOST" ] || return 0
+    _geo=$(curl -q -fsS --noproxy '*' --connect-timeout 2 --max-time 4 \
+        --max-filesize 4096 --retry 0 \
+        "https://ipwho.is/$SUB_PUBLIC_HOST?lang=zh-CN&fields=success,ip,country,country_code,flag.emoji" \
+        2>/dev/null) || return 0
+    _geo_ip=$(printf '%s' "$_geo" | jq -er '.ip | select(type == "string")' 2>/dev/null) || return 0
+    [ -n "$(printf '%s' "$_geo_ip" | normalize_summary_addresses '' true)" ] || return 0
+    _same_ip_count=$(printf '%s\n%s\n' "$SUB_PUBLIC_HOST" "$_geo_ip" | normalize_summary_addresses '' true | wc -l | tr -d ' ')
+    [ "$_same_ip_count" = 1 ] || return 0
+    _label=$(printf '%s' "$_geo" | jq -er '
+        select(.success == true) |
+        select(.country_code | type == "string" and test("^[A-Z]{2}$")) |
+        select(.country | type == "string" and length > 0 and length < 80 and (test("[\\u0000-\\u001f]") | not)) |
+        select(.flag.emoji | type == "string" and length == 2) |
+        "\(.flag.emoji) \(.country)节点"' 2>/dev/null) || return 0
+    NODE_LABEL="$_label"
+}
+
+clash_subscription_template() {
+    cat <<'CLASH_TEMPLATE'
+tun:
+  enable: true
+  auto-route: true
+  dns-hijack:
+  - any:53
+  - tcp://any:53
+dns:
+  enable: true
+  listen: 0.0.0.0:53
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  respect-rules: false
+  prefer-h3: false
+  proxy-server-nameserver:
+  - https://120.53.53.53/dns-query
+  - https://223.6.6.6/dns-query
+  - 119.29.29.29
+  - 223.5.5.5
+  direct-nameserver:
+  - https://120.53.53.53/dns-query
+  - https://223.6.6.6/dns-query
+  - 119.29.29.29
+  - 223.5.5.5
+  direct-nameserver-follow-policy: true
+  nameserver-policy:
+    rule-set:private:
+    - system
+    +.cn:
+    - https://120.53.53.53/dns-query
+    - https://223.6.6.6/dns-query
+    - 119.29.29.29
+    - 223.5.5.5
+    rule-set:direct:
+    - https://120.53.53.53/dns-query
+    - https://223.6.6.6/dns-query
+    - 119.29.29.29
+    - 223.5.5.5
+  nameserver:
+  - https://1.1.1.1/dns-query#RULES
+  - https://8.8.8.8/dns-query#RULES
+port: 7890
+socks-port: 7891
+allow-lan: true
+mode: rule
+log-level: info
+external-controller: 127.0.0.1:9090
+proxy-groups:
+- name: ☁️ iCloud
+  type: select
+  proxies:
+  - DIRECT
+  - all
+- name: 🍎 Apple
+  type: select
+  proxies:
+  - DIRECT
+  - all
+- name: 💻 Microsoft
+  type: select
+  proxies:
+  - DIRECT
+  - all
+- name: 🎮 Steam 大陆访问
+  type: select
+  proxies:
+  - DIRECT
+  - all
+- name: 📚 科研资源
+  type: select
+  proxies:
+  - DIRECT
+  - all
+- name: 💬 AI 平台
+  type: select
+  proxies:
+  - all
+  - DIRECT
+- name: 🚀 境外网站
+  type: select
+  proxies:
+  - all
+  - DIRECT
+- name: 🛑 广告拦截
+  type: select
+  proxies:
+  - REJECT
+  - DIRECT
+- name: 🇨🇳 国内应用
+  type: select
+  proxies:
+  - DIRECT
+  - all
+- name: 🇨🇳 国内网段
+  type: select
+  proxies:
+  - DIRECT
+  - all
+- name: 🐟 漏网之鱼
+  type: select
+  proxies:
+  - all
+  - DIRECT
+rule-providers:
+  reject:
+    type: http
+    behavior: domain
+    url: https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/reject.txt
+    path: ./ruleset/reject.yaml
+    interval: 86400
+  icloud:
+    type: http
+    behavior: domain
+    url: https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/icloud.txt
+    path: ./ruleset/icloud.yaml
+    interval: 86400
+  apple:
+    type: http
+    behavior: domain
+    url: https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/apple.txt
+    path: ./ruleset/apple.yaml
+    interval: 86400
+  microsoft:
+    type: http
+    behavior: classical
+    url: https://cdn.jsdelivr.net/gh/blackmatrix7/ios_rule_script@master/rule/Clash/Microsoft/Microsoft.yaml
+    path: ./ruleset/microsoft.yaml
+    interval: 86400
+  steamcn:
+    type: http
+    behavior: classical
+    url: https://cdn.jsdelivr.net/gh/blackmatrix7/ios_rule_script@master/rule/Clash/SteamCN/SteamCN.yaml
+    path: ./ruleset/steamcn.yaml
+  proxy:
+    type: http
+    behavior: domain
+    url: https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/proxy.txt
+    path: ./ruleset/proxy.yaml
+    interval: 86400
+  direct:
+    type: http
+    behavior: domain
+    url: https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/direct.txt
+    path: ./ruleset/direct.yaml
+    interval: 86400
+  private:
+    type: http
+    behavior: domain
+    url: https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/private.txt
+    path: ./ruleset/private.yaml
+    interval: 86400
+  cncidr:
+    type: http
+    behavior: ipcidr
+    url: https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/cncidr.txt
+    path: ./ruleset/cncidr.yaml
+    interval: 86400
+  lancidr:
+    type: http
+    behavior: ipcidr
+    url: https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/lancidr.txt
+    path: ./ruleset/lancidr.yaml
+    interval: 86400
+  applications:
+    type: http
+    behavior: classical
+    url: https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/applications.txt
+    path: ./ruleset/applications.yaml
+    interval: 86400
+  scholar-intl:
+    type: http
+    behavior: domain
+    url: https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/category-scholar-!cn.yaml
+    path: ./ruleset/scholar-intl.yaml
+    interval: 86400
+  ai-intl:
+    type: http
+    behavior: domain
+    url: https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/category-ai-!cn.yaml
+    path: ./ruleset/ai-intl.yaml
+    interval: 86400
+rules:
+- RULE-SET,reject,🛑 广告拦截
+- RULE-SET,icloud,☁️ iCloud
+- RULE-SET,apple,🍎 Apple
+- RULE-SET,microsoft,💻 Microsoft
+- RULE-SET,steamcn,🎮 Steam 大陆访问
+- RULE-SET,scholar-intl,📚 科研资源
+- RULE-SET,ai-intl,💬 AI 平台
+- DOMAIN-SUFFIX,auth0.com,💬 AI 平台
+- DOMAIN-SUFFIX,challenges.cloudflare.com,💬 AI 平台
+- DOMAIN-SUFFIX,client-api.arkoselabs.com,💬 AI 平台
+- DOMAIN-SUFFIX,events.statsigapi.net,💬 AI 平台
+- DOMAIN-SUFFIX,featuregates.org,💬 AI 平台
+- DOMAIN-SUFFIX,identrust.com,💬 AI 平台
+- DOMAIN-SUFFIX,intercom.io,💬 AI 平台
+- DOMAIN-SUFFIX,intercomcdn.com,💬 AI 平台
+- DOMAIN-SUFFIX,stripe.com,💬 AI 平台
+- RULE-SET,proxy,🚀 境外网站
+- RULE-SET,cncidr,🇨🇳 国内网段
+- RULE-SET,applications,🇨🇳 国内应用
+- RULE-SET,direct,DIRECT
+- RULE-SET,lancidr,DIRECT
+- RULE-SET,private,DIRECT
+- GEOIP,LAN,DIRECT
+- GEOIP,CN,DIRECT
+- MATCH,🐟 漏网之鱼
+CLASH_TEMPLATE
+}
+
+create_subscription_client() {
+    ensure_subscription_jq || { log_warn "Could not install jq; skipping subscription setup"; return 1; }
+    ensure_session || return 1
+    _inbound_response=$(panel_request GET inbounds) || return 1
+    _inbounds=$(printf '%s' "$_inbound_response" | jq -ce '
+        select(.success == true) | .obj.inbounds | select(type == "array" and length > 0)') || {
+        log_warn "No inbounds available; create an inbound before creating a subscription client"
+        return 1
+    }
+    _ids=$(printf '%s' "$_inbounds" | jq -r 'map(.id|tostring)|join(",")') || return 1
+    _full_response=$(panel_request GET "inbounds?id=$_ids") || return 1
+    _inbounds=$(printf '%s' "$_full_response" | jq -ce 'select(.success == true) | .obj.inbounds | select(type == "array" and length > 0)') || return 1
+    _settings_response=$(panel_request GET settings) || return 1
+    _settings=$(printf '%s' "$_settings_response" | jq -ce 'select(.success == true) | .obj | select(type == "object")') || return 1
+
+    discover_public_addresses
+    SUB_PUBLIC_HOST="${PUBLIC_IPV4:-$PUBLIC_IPV6}"
+    lookup_node_label
+
+    # A random name also makes the subscription URL difficult to guess.
+    _client_name=$(random_password)
+    _client_pass=$(random_password)
+    _uuid_hex=$(openssl rand -hex 16 2>/dev/null) || return 1
+    _ss16=$(openssl rand -base64 16 2>/dev/null) || return 1
+    _ss32=$(openssl rand -base64 32 2>/dev/null) || return 1
+    case "$_client_name$_client_pass" in *[!A-Za-z0-9]*) return 1 ;; esac
+    [ ${#_client_name} -eq 24 ] && [ ${#_client_pass} -eq 24 ] && [ ${#_uuid_hex} -eq 32 ] || return 1
+    _client_uuid=$(printf '%s' "$_uuid_hex" | sed 's/^\(........\)\(....\).\(...\).\(...\)\(............\)$/\1-\2-4\3-8\4-\5/')
+
+    # Empty published addresses otherwise inherit the loopback API hostname.
+    # Keep existing explicit addresses, including custom NAT/CDN port mappings.
+    if [ -n "$SUB_PUBLIC_HOST" ]; then
+        _empty_ids=$(printf '%s' "$_inbounds" | jq -r '.[] | select((.addrs // []) | length == 0) | .id')
+        for _inbound_id in $_empty_ids; do
+            _updated_inbound=$(printf '%s' "$_inbounds" | jq -c --argjson id "$_inbound_id" --arg host "$SUB_PUBLIC_HOST" '
+                .[] | select(.id == $id) | .addrs = [{server:$host, server_port:.listen_port, remark:""}]') || return 1
+            _saved=$(panel_save inbounds edit "$_updated_inbound")
+            printf '%s' "$_saved" | jq -e '.success == true' >/dev/null || return 1
+        done
+    fi
+
+    _client_json=$(printf '%s' "$_inbounds" | jq -c \
+        --arg name "$_client_name" --arg pass "$_client_pass" --arg uuid "$_client_uuid" \
+        --arg ss16 "$_ss16" --arg ss32 "$_ss32" --arg label "$NODE_LABEL · " '
+        {enable:true, name:$name, remark:$label, volume:0, expiry:0,
+         inbounds:map(.id), links:[], config:{
+            vless:{name:$name,uuid:$uuid,flow:"xtls-rprx-vision"},
+            vmess:{name:$name,uuid:$uuid,alterId:0},
+            trojan:{name:$name,password:$pass}, hysteria:{name:$name,auth_str:$pass},
+            hysteria2:{name:$name,password:$pass}, tuic:{name:$name,uuid:$uuid,password:$pass},
+            anytls:{name:$name,password:$pass}, shadowtls:{name:$name,password:$pass},
+            socks:{username:$name,password:$pass}, http:{username:$name,password:$pass},
+            mixed:{username:$name,password:$pass}, naive:{username:$name,password:$pass},
+            shadowsocks:{name:$name,password:$ss32}, shadowsocks16:{name:$name,password:$ss16},
+            snell:{name:$name,userkey:$ss32}
+         }}') || return 1
+    _saved=$(panel_save clients new "$_client_json")
+    printf '%s' "$_saved" | jq -e '.success == true' >/dev/null || return 1
+    read_subscription_address "$_settings"
+    SUB_CLIENT_NAME="$_client_name"
+
+    # Keep a root-only backup before replacing the panel-wide Clash template.
+    (umask 077; printf '%s\n' "$_settings" | jq '{subClashExt,subClashNoDefGrp,subClashSprtAll}' > "$INSTALL_DIR/clash-template-backup-$_client_name.json") || return 1
+    _template_settings=$(clash_subscription_template | jq -Rs '{subClashExt:.,subClashNoDefGrp:"true",subClashSprtAll:"true"}') || return 1
+    _saved=$(panel_save settings "" "$_template_settings")
+    if ! printf '%s' "$_saved" | jq -e '.success == true' >/dev/null; then
+        log_warn "Client created, but the Clash template could not be saved"
+        return 1
+    fi
+    log_info "Unlimited client created with all current inbounds and the Clash template"
+}
+
+read_subscription_address() {
+    # subURI may contain the provider's public NAT mapping or reverse proxy.
+    SUB_BASE_URI=$(printf '%s' "$1" | jq -r '.subURI // empty')
+    SUB_PORT=$(printf '%s' "$1" | jq -r '.subPort // "2096"')
+    SUB_PATH=$(printf '%s' "$1" | jq -r '.subPath // "/sub/"')
+    case "$SUB_PATH" in /*) ;; *) SUB_PATH="/$SUB_PATH" ;; esac
+    case "$SUB_PATH" in */) ;; *) SUB_PATH="$SUB_PATH/" ;; esac
+    SUB_DOMAIN=$(printf '%s' "$1" | jq -r '.subDomain // empty')
+    SUB_SCHEME=$(printf '%s' "$1" | jq -r 'if (.subCertFile // "") != "" and (.subKeyFile // "") != "" then "https" else "http" end')
+    case "$SUB_BASE_URI" in '') ;; */) ;; *) SUB_BASE_URI="$SUB_BASE_URI/" ;; esac
+}
+
+print_subscription_urls() {
+    [ -n "${SUB_CLIENT_NAME:-}" ] || return 0
+    _sub_hosts=$(printf '%s\n' "$_hosts" | tr -d '[]' | normalize_summary_addresses '' true)
+    if [ -z "$SUB_BASE_URI$SUB_DOMAIN$_sub_hosts" ]; then return 0; fi
+    printf '\n  Clash YAML subscription (unlimited traffic, no expiry):\n'
+    if [ -n "$SUB_BASE_URI" ]; then
+        printf '    %s%s?format=clash\n' "$SUB_BASE_URI" "$SUB_CLIENT_NAME"
+    elif [ -n "$SUB_DOMAIN" ]; then
+        _sub_host="$SUB_DOMAIN"
+        case "$_sub_host" in \[*\]) ;; *:*) _sub_host="[$_sub_host]" ;; esac
+        printf '    %s://%s:%s%s%s?format=clash\n' "$SUB_SCHEME" "$_sub_host" "$SUB_PORT" "$SUB_PATH" "$SUB_CLIENT_NAME"
+    else
+        while IFS= read -r _sub_host; do
+            [ -n "$_sub_host" ] || continue
+            printf '    %s://%s:%s%s%s?format=clash\n' "$SUB_SCHEME" "$_sub_host" "$SUB_PORT" "$SUB_PATH" "$SUB_CLIENT_NAME"
+        done <<SUB_HOSTS
+$_sub_hosts
+SUB_HOSTS
+    fi
+    printf '    Keep this URL private. For NAT, use the public mapped subscription port (default internal port: 2096/TCP).\n'
+}
+
 # ── Report ───────────────────────────────────────────────────────────────────
 # Printed at the very end so credentials and the node details are the last
 # thing on screen rather than scrolled past.
 show_summary() {
-    _host=$(hostname -I 2>/dev/null | awk '{print $1}')
-    [ -z "$_host" ] && _host=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
-    [ -z "$_host" ] && _host="<server-ip>"
+    _hosts=$(collect_summary_addresses)
 
     _scheme="http"; $PANEL_TLS && _scheme="https"
 
     printf "\n"
     printf "${GREEN}=================== Deployment summary ===================${NC}\n"
     printf "\n"
-    printf "  Panel:    %s://%s:%s%s\n" "$_scheme" "$_host" "$PANEL_PORT" "$PANEL_PATH"
+    while IFS= read -r _host; do
+        [ -n "$_host" ] || continue
+        printf "  Panel:    %s://%s:%s%s\n" "$_scheme" "$_host" "$PANEL_PORT" "$PANEL_PATH"
+    done <<ADDRESSES
+$_hosts
+ADDRESSES
     if $PANEL_TLS; then
         printf "            (self-signed certificate -- the browser will warn)\n"
     fi
@@ -1349,14 +1832,18 @@ show_summary() {
         printf "  Password: ${RED}not set -- run: $INSTALL_DIR/sui admin -reset${NC}\n"
     fi
 
+    print_subscription_urls
+
     if $HY2_OK; then
         printf "\n"
         printf "  Hysteria2 node: %s\n" "$HY2_TAG"
         printf "    Port: %s/UDP\n" "$HY2_PORT"
         printf "    SNI:  %s\n" "$HY2_SNI"
         printf "    Obfuscation: Salamander (included in panel subscriptions)\n"
-        printf "    Add a client in the panel to get a subscription link.\n"
-        if [ -n "$_host" ] && [ "$_host" != "<server-ip>" ]; then
+        if [ -z "$SUB_CLIENT_NAME" ]; then
+            printf "    Add a client in the panel to get a subscription link.\n"
+        fi
+        if [ -n "$_hosts" ]; then
             printf "    ${YELLOW}Open %s/UDP in your firewall/security group.${NC}\n" "$HY2_PORT"
         fi
     fi
@@ -1366,8 +1853,10 @@ show_summary() {
         printf "    Port: %s/TCP\n" "$VLESS_PORT"
         printf "    SNI:  %s\n" "$VLESS_SNI"
         printf "    Fingerprint: chrome (uTLS)\n"
-        printf "    Add a client in the panel to get a subscription link.\n"
-        if [ -n "$_host" ] && [ "$_host" != "<server-ip>" ]; then
+        if [ -z "$SUB_CLIENT_NAME" ]; then
+            printf "    Add a client in the panel to get a subscription link.\n"
+        fi
+        if [ -n "$_hosts" ]; then
             printf "    ${YELLOW}Open %s/TCP in your firewall/security group.${NC}\n" "$VLESS_PORT"
         fi
     fi
@@ -1526,6 +2015,11 @@ main() {
         fi
     else
         log_info "Skipping VLESS + Reality"
+    fi
+
+    # 5. The template is panel-wide, so include that effect in the question.
+    if ask "Create an unlimited client for ALL current inbounds and apply the bundled Clash template to subscriptions?"; then
+        create_subscription_client || log_warn "Subscription setup incomplete; review the client and subscription settings in the panel"
     fi
 
     rm -f "$COOKIE_JAR" 2>/dev/null || true
