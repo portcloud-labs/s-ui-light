@@ -25,11 +25,11 @@ wget -O install.sh https://raw.githubusercontent.com/samoyed24/s-ui-light/main/s
 1. **重置管理员密码**（无需询问）。用户名保持 `admin`，密码改为随机生成的 24 位强密码，
    并在最后打印出来。s-ui 只存密码哈希，**这串密码只会显示这一次，请立刻保存**。
 
-2. **是否给面板启用 HTTPS**（**强烈建议开启**，y/N）。选 yes 会生成自签证书供面板 2095 使用，
+2. **是否给面板启用 HTTPS**（**强烈建议开启**，Y/n，回车默认 yes）。选 yes 会生成自签证书供面板 2095 使用，
    浏览器需要信任此证书；选 no 则面板使用 HTTP。**订阅 2096 始终使用 HTTP**，避免 Clash
    因无法验证自签证书而下载失败。再次运行脚本时，也会清除旧的订阅证书设置并修正订阅入口协议。
 
-3. **是否部署 Hysteria2 节点**（y/N）。选 yes 会创建一个 Hysteria2 入站：
+3. **是否部署 Hysteria2 节点**（Y/n，回车默认 yes）。选 yes 会创建一个 Hysteria2 入站：
 
    - 复用上面生成的自签证书（第 2 步选了 no 就现在生成）
    - 端口随机取 20000 以上
@@ -58,7 +58,7 @@ wget -O install.sh https://raw.githubusercontent.com/samoyed24/s-ui-light/main/s
 
    VLESS 原生 URI 订阅会自动携带 `security=reality&pbk=…&sid=…&fp=chrome`。
 
-5. **是否创建无限流量客户端并应用 Clash 模板**（y/N）。选 yes 会：
+5. **是否创建无限流量客户端并应用 Clash 模板**（Y/n，回车默认 yes）。选 yes 会：
 
    - 创建随机名称、独立于管理员密码的客户端，流量不限、永久有效，勾选当前全部入站；
      后续新增入站需在面板另行分配
@@ -71,7 +71,8 @@ wget -O install.sh https://raw.githubusercontent.com/samoyed24/s-ui-light/main/s
      单次运行每种协议只创建一个入站，IPv4/IPv6 不会各创建一个；重复运行或手动新增导致
      同协议多个入站时，才会用 `Hy2 2` 等最短编号区分
    - 应用内置的 iCloud、Apple、Microsoft、Steam、科研、AI、境外网站、广告、国内和兜底分流模板；
-     面板自动生成真实节点和认证信息，各策略组按原顺序展开全部节点
+     面板自动生成真实节点和认证信息。`🚀 节点选择` 集中列出全部节点及一个 `DIRECT`，
+     其他策略组原来列出节点的位置改为引用 `🚀 节点选择`，保留各组原有的默认选择顺序
    - **安装结束直接打印 Clash YAML 订阅地址**：
      `http://公网IP:2096/sub/随机客户端名称?format=clash`；IPv6 自动加方括号
 

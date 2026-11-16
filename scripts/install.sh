@@ -77,11 +77,18 @@ ask() {
         no)  return 1 ;;
     esac
     [ -t 0 ] || return 1
-    printf "%s [y/N]: " "$1"
+    _ask_default="${2:-no}"
+    if [ "$_ask_default" = yes ]; then
+        printf "%s [Y/n]: " "$1"
+    else
+        printf "%s [y/N]: " "$1"
+    fi
     # A failed read (EOF, Ctrl-D) must not abort the script under set -e.
+    _ans=""
     read -r _ans || true
     case "$_ans" in
         y|Y|yes|YES) return 0 ;;
+        '')          [ "$_ask_default" = yes ] ;;
         *)           return 1 ;;
     esac
 }
@@ -1579,40 +1586,45 @@ mode: rule
 log-level: info
 external-controller: 127.0.0.1:9090
 proxy-groups:
+- name: 🚀 节点选择
+  type: select
+  proxies:
+  - all
+  - DIRECT
 - name: ☁️ iCloud
   type: select
   proxies:
   - DIRECT
-  - all
+  - 🚀 节点选择
 - name: 🍎 Apple
   type: select
   proxies:
   - DIRECT
-  - all
+  - 🚀 节点选择
 - name: 💻 Microsoft
   type: select
   proxies:
   - DIRECT
-  - all
+  - 🚀 节点选择
 - name: 🎮 Steam 大陆访问
   type: select
   proxies:
   - DIRECT
-  - all
+  - 🚀 节点选择
 - name: 📚 科研资源
   type: select
   proxies:
   - DIRECT
-  - all
+  - 🚀 节点选择
 - name: 💬 AI 平台
   type: select
   proxies:
-  - all
+  - 🚀 节点选择
   - DIRECT
 - name: 🚀 境外网站
   type: select
   proxies:
-  - all
+  - 🚀 节点选择
   - DIRECT
 - name: 🛑 广告拦截
   type: select
@@ -1623,16 +1635,16 @@ proxy-groups:
   type: select
   proxies:
   - DIRECT
-  - all
+  - 🚀 节点选择
 - name: 🇨🇳 国内网段
   type: select
   proxies:
   - DIRECT
-  - all
+  - 🚀 节点选择
 - name: 🐟 漏网之鱼
   type: select
   proxies:
-  - all
+  - 🚀 节点选择
   - DIRECT
 rule-providers:
   reject:
@@ -2020,7 +2032,7 @@ main() {
 
     # 2. Panel TLS is optional; subscription TLS is cleared on repeat installs too.
     detect_panel_transport || { log_error "Could not reach the panel"; return 1; }
-    if ask "Enable HTTPS for the PANEL? STRONGLY RECOMMENDED (self-signed certificate; subscriptions stay HTTP)"; then
+    if ask "Serve the s-ui panel over HTTPS with a self-signed certificate (strongly recommended)?" yes; then
         generate_cert || { log_error "Could not generate the HTTPS certificate"; return 1; }
         panel_login || return 1
         configure_web_transport https || return 1
@@ -2031,7 +2043,7 @@ main() {
 
     # 3. Offer a Hysteria2 node. The certificate from step 2 is reused when it
     #    exists; otherwise one is generated now, since the protocol requires TLS.
-    if ask "Deploy a Hysteria2 node with Salamander obfuscation?"; then
+    if ask "Deploy a Hysteria2 node with Salamander obfuscation?" yes; then
         # Hysteria2 requires TLS. Reuse the certificate from step 2, or make
         # one now if that step was declined.
         [ -n "$CERT_CRT" ] || generate_cert || log_warn "Certificate generation failed"
@@ -2075,7 +2087,7 @@ main() {
     fi
 
     # 5. The template is panel-wide, so include that effect in the question.
-    if ask "Create an unlimited client for ALL current inbounds and apply the bundled Clash template to subscriptions?"; then
+    if ask "Create an unlimited client for ALL current inbounds and apply the bundled Clash template to subscriptions?" yes; then
         create_subscription_client || log_warn "Subscription setup incomplete; review the client and subscription settings in the panel"
     fi
 
