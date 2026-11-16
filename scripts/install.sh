@@ -355,7 +355,9 @@ configure_memory_guard() {
         "$GO_MEM_LIMIT" "$GO_GC" "$GO_MAXPROCS")
 
     log_warn "Low-memory mode: GOMEMLIMIT=$GO_MEM_LIMIT GOGC=$GO_GC GOMAXPROCS=$GO_MAXPROCS"
-    log_warn "On a 64 MiB host prefer --no-prompt and avoid opening extra SSH sessions"
+    if [ -n "$MEM_LIMIT_BYTES" ] && [ "$MEM_LIMIT_BYTES" -le 67108864 ]; then
+        log_warn "On a 64 MiB host prefer --no-prompt and avoid opening extra SSH sessions"
+    fi
 }
 
 # ── Choose the download rate ─────────────────────────────────────────────────
@@ -473,7 +475,7 @@ check_deps() {
 
                 log_info "Installing missing dependencies:$packages"
                 apt-get update -qq
-                apt-get install -y -qq $packages
+                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o Dpkg::Use-Pty=0 $packages
                 if [ $? -ne 0 ]; then
                     log_error "Failed to install dependencies. Run manually: apt-get install -y$packages"
                     exit 1
@@ -1497,7 +1499,7 @@ ensure_subscription_jq() {
     log_info "Installing jq for subscription setup..."
     case "$OS" in
         alpine) apk add --no-cache jq || return 1 ;;
-        debian) apt-get update -qq && apt-get install -y -qq jq || return 1 ;;
+        debian) apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o Dpkg::Use-Pty=0 jq || return 1 ;;
         *) return 1 ;;
     esac
     command -v jq >/dev/null 2>&1
