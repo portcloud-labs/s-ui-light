@@ -121,6 +121,7 @@ PANEL_TLS=false
 PUBLIC_IPS_READY=false
 PUBLIC_IPV4=""
 PUBLIC_IPV6=""
+PUBLIC_IPV6_LISTEN=""
 SUB_CLIENT_NAME=""
 REQUESTED_PANEL_PORT="${SUI_PANEL_PORT:-}"
 REQUESTED_SUB_PORT="${SUI_SUB_PORT:-}"
@@ -1628,6 +1629,12 @@ ensure_subscription_jq() {
     command -v jq >/dev/null 2>&1
 }
 
+interface_public_ipv6() {
+    ip -6 -o addr show scope global 2>/dev/null | \
+        awk '/inet6/ && !/tentative|dadfailed/ {sub(/\/.*/, "", $4); print $4}' | \
+        normalize_summary_addresses 6 true | tr -d '[]'
+}
+
 discover_public_addresses() {
     [ "${PUBLIC_IPS_READY:-false}" = true ] && return 0
     PUBLIC_IPV4=$(curl -q -4 -fsS --noproxy '*' --connect-timeout 2 --max-time 4 \
@@ -1636,13 +1643,17 @@ discover_public_addresses() {
     PUBLIC_IPV6=$(curl -q -6 -fsS --noproxy '*' --connect-timeout 2 --max-time 4 \
         --max-filesize 128 --retry 0 https://api6.ipify.org 2>/dev/null) || PUBLIC_IPV6=""
     PUBLIC_IPV6=$(printf '%s\n' "$PUBLIC_IPV6" | normalize_summary_addresses 6 true | head -1 | tr -d '[]')
+    # Use a locally assigned public IPv6 for a distinct IPv6 listener. It also
+    # provides a silent fallback if the external IPv6 lookup is unavailable.
+    PUBLIC_IPV6_LISTEN=$(interface_public_ipv6 | head -1)
+    if [ -n "$PUBLIC_IPV6_LISTEN" ]; then PUBLIC_IPV6="$PUBLIC_IPV6_LISTEN"; fi
     PUBLIC_IPS_READY=true
 }
 
 # Lookup the chosen address, not the API connection's possibly different exit.
 # All failures (including HTTP 200 + success:false) keep the generic name.
 lookup_node_label() {
-    NODE_LABEL="🚀 加速节点"
+    NODE_LABEL="🚀加速节点"
     [ -n "$SUB_PUBLIC_HOST" ] || return 0
     _geo=$(curl -q -fsS --noproxy '*' --connect-timeout 2 --max-time 4 \
         --max-filesize 4096 --retry 0 \
@@ -1878,22 +1889,109 @@ rules:
 CLASH_TEMPLATE
 }
 
+# Full objects are required: list responses omit credentials and published IPs.
+read_full_inbounds() {
+    _read_list=$(panel_request GET inbounds) || return 1
+    _read_ids=$(printf '%s' "$_read_list" | jq -er 'select(.success == true) | .obj.inbounds | select(type == "array" and length > 0) | map(.id|tostring)|join(",")') || return 1
+    _read_full=$(panel_request GET "inbounds?id=$_read_ids") || return 1
+    printf '%s' "$_read_full" | jq -ce 'select(.success == true) | .obj.inbounds | select(type == "array" and length > 0)'
+}
+
+# A separate IPv6 listener keeps the requested "country v6 · protocol" names
+# without relying on s-ui address remarks (which are appended after the tag).
+# Only native, locally assigned public IPv6 addresses can be bound here.
+ensure_ipv6_inbounds() {
+    IPV6_INBOUNDS_CHANGED=false
+    [ -n "$PUBLIC_IPV4" ] && [ -n "$PUBLIC_IPV6" ] && [ -n "${PUBLIC_IPV6_LISTEN:-}" ] || return 0
+    _dual_inbounds="$1"
+    _dual_ids=$(printf '%s' "$_dual_inbounds" | jq -r '.[] | select((.type=="hysteria2" or .type=="vless") and ((.listen // "::")=="::" or .listen=="0.0.0.0") and all(.addrs[]?; (.server|contains(":"))|not)) | .id') || return 1
+    for _dual_id in $_dual_ids; do
+        _dual_original=$(printf '%s' "$_dual_inbounds" | jq -c --argjson id "$_dual_id" '.[]|select(.id==$id)') || return 1
+        _dual_exists=$(printf '%s' "$_dual_inbounds" | jq -r --argjson original "$_dual_original" --arg ip "$PUBLIC_IPV6_LISTEN" '
+            any(.[]; .type==$original.type and .listen_port==$original.listen_port and .tls_id==$original.tls_id and .listen==$ip)') || return 1
+        [ "$_dual_exists" = false ] || continue
+        _dual_clients=$(panel_request GET clients) || return 1
+        _dual_client_ids=$(printf '%s' "$_dual_clients" | jq -er --argjson id "$_dual_id" 'select(.success==true) | (.obj.clients // []) | map(select((.inbounds // [])|index($id))) | map(.id|tostring)|join(",")') || return 1
+        _dual_v4=$(printf '%s' "$_dual_original" | jq -c --arg host "$PUBLIC_IPV4" '
+            .listen="0.0.0.0" | if ((.addrs // [])|length)==0 then .addrs=[{server:$host,server_port:.listen_port,remark:""}] else . end') || return 1
+        _dual_saved=$(panel_save inbounds edit "$_dual_v4")
+        printf '%s' "$_dual_saved" | jq -e '.success==true' >/dev/null || return 1
+        _dual_v6=$(printf '%s' "$_dual_original" | jq -c --arg host "$PUBLIC_IPV6" --arg bind "$PUBLIC_IPV6_LISTEN" '
+            .tag=(.tag+"-ipv6-"+(.id|tostring)) | .id=0 | .listen=$bind |
+            .addrs=[{server:$host,server_port:.listen_port,remark:""}] | .out_json={}') || return 1
+        _dual_saved=$(panel_request POST save --data-urlencode 'object=inbounds' --data-urlencode 'action=new' \
+            --data-urlencode "data=$_dual_v6" --data-urlencode "initUsers=$_dual_client_ids") || _dual_saved=''
+        if ! printf '%s' "$_dual_saved" | jq -e '.success==true' >/dev/null; then
+            panel_save inbounds edit "$_dual_original" >/dev/null
+            return 1
+        fi
+        IPV6_INBOUNDS_CHANGED=true
+    done
+}
+
+prepare_named_inbounds() {
+    printf '%s' "$1" | jq -c --arg node_label "$NODE_LABEL" --arg host "$SUB_PUBLIC_HOST" '
+        sort_by(.id) | reduce .[] as $original ({counts:{},items:[]};
+            ($original | if $host!="" and ((.addrs // [])|length)==0
+                then .addrs=[{server:$host,server_port:.listen_port,remark:""}] else . end) as $inb |
+            ($inb.type) as $type |
+            (if (($inb.addrs[0].server // $host)|contains(":")) then "6" else "4" end) as $family |
+            ($type+"/"+$family) as $count_key |
+            (.counts[$count_key] // 0) as $count |
+            .counts[$count_key]=($count+1) |
+            ({hysteria2:"Hy2",vless:"VLESS",vmess:"VMess",trojan:"Trojan",tuic:"TUIC",
+              shadowsocks:"SS",anytls:"AnyTLS",hysteria:"Hy",socks:"SOCKS",http:"HTTP",mixed:"Mixed"}[$type] // $type) as $protocol |
+            .items += [($inb | .tag=($node_label+(if $family=="6" then " v6" else "" end)+" · "+$protocol+
+                (if $count==0 then "" else " "+(($count+1)|tostring) end)))]
+        ) | .items'
+}
+
+apply_inbound_names() {
+    _inbounds="$1"
+    _named_inbounds=$(prepare_named_inbounds "$_inbounds") || return 1
+    for _inbound_id in $(printf '%s' "$_named_inbounds" | jq -r '.[].id'); do
+        _updated_inbound=$(printf '%s' "$_named_inbounds" | jq -c --argjson id "$_inbound_id" '.[] | select(.id == $id)') || return 1
+        _saved=$(panel_save inbounds edit "$_updated_inbound")
+        printf '%s' "$_saved" | jq -e '.success == true' >/dev/null || return 1
+    done
+    # Keep this run's node summary paired with its own port after renaming.
+    _hy2_id=$(printf '%s' "$_inbounds" | jq -r --arg tag "${HY2_TAG:-}" '.[] | select(.tag == $tag) | .id' | head -1)
+    _vless_id=$(printf '%s' "$_inbounds" | jq -r --arg tag "${VLESS_TAG:-}" '.[] | select(.tag == $tag) | .id' | head -1)
+    if [ -n "$_hy2_id" ]; then
+        HY2_TAG=$(printf '%s' "$_named_inbounds" | jq -r --argjson id "$_hy2_id" '.[] | select(.id == $id) | .tag')
+    fi
+    if [ -n "$_vless_id" ]; then
+        VLESS_TAG=$(printf '%s' "$_named_inbounds" | jq -r --argjson id "$_vless_id" '.[] | select(.id == $id) | .tag')
+    fi
+
+}
+
+prepare_dual_stack_inbounds() {
+    ensure_session || return 1
+    _prepare_inbounds=$(read_full_inbounds) || return 1
+    discover_public_addresses
+    ensure_ipv6_inbounds "$_prepare_inbounds" || return 1
+    if $IPV6_INBOUNDS_CHANGED; then
+        _prepare_inbounds=$(read_full_inbounds) || return 1
+        SUB_PUBLIC_HOST="${PUBLIC_IPV4:-$PUBLIC_IPV6}"
+        lookup_node_label
+        apply_inbound_names "$_prepare_inbounds" || return 1
+    fi
+}
+
 create_subscription_client() {
     ensure_subscription_jq || { log_warn "Could not install jq; skipping subscription setup"; return 1; }
     ensure_session || return 1
-    _inbound_response=$(panel_request GET inbounds) || return 1
-    _inbounds=$(printf '%s' "$_inbound_response" | jq -ce '
-        select(.success == true) | .obj.inbounds | select(type == "array" and length > 0)') || {
+    _inbounds=$(read_full_inbounds) || {
         log_warn "No inbounds available; create an inbound before creating a subscription client"
         return 1
     }
-    _ids=$(printf '%s' "$_inbounds" | jq -r 'map(.id|tostring)|join(",")') || return 1
-    _full_response=$(panel_request GET "inbounds?id=$_ids") || return 1
-    _inbounds=$(printf '%s' "$_full_response" | jq -ce 'select(.success == true) | .obj.inbounds | select(type == "array" and length > 0)') || return 1
     _settings_response=$(panel_request GET settings) || return 1
     _settings=$(printf '%s' "$_settings_response" | jq -ce 'select(.success == true) | .obj | select(type == "object")') || return 1
 
     discover_public_addresses
+    ensure_ipv6_inbounds "$_inbounds" || return 1
+    if $IPV6_INBOUNDS_CHANGED; then _inbounds=$(read_full_inbounds) || return 1; fi
     SUB_PUBLIC_HOST="${PUBLIC_IPV4:-$PUBLIC_IPV6}"
     lookup_node_label
 
@@ -1910,33 +2008,7 @@ create_subscription_client() {
     # Use the inbound tag itself for the display name: s-ui inserts a hyphen
     # between client remark and tag, so a client prefix cannot produce the
     # requested compact name exactly. Full objects preserve credentials/TLS.
-    _named_inbounds=$(printf '%s' "$_inbounds" | jq -c --arg node_label "$NODE_LABEL" --arg host "$SUB_PUBLIC_HOST" '
-        sort_by(.id) | reduce .[] as $inb ({counts:{},items:[]};
-            ($inb.type) as $type |
-            (.counts[$type] // 0) as $count |
-            .counts[$type] = ($count + 1) |
-            ({hysteria2:"Hy2",vless:"VLESS",vmess:"VMess",trojan:"Trojan",tuic:"TUIC",
-              shadowsocks:"SS",anytls:"AnyTLS",hysteria:"Hy",socks:"SOCKS",http:"HTTP",mixed:"Mixed"}[$type] // $type) as $protocol |
-            .items += [($inb |
-                if $host != "" and ((.addrs // [])|length) == 0
-                then .addrs = [{server:$host, server_port:.listen_port, remark:""}] else . end |
-                .tag = ($node_label + (if ((.addrs[0].server // $host)|contains(":")) then " v6" else "" end) + " · " + $protocol +
-                    (if $count == 0 then "" else " " + (($count + 1)|tostring) end)))]
-        ) | .items') || return 1
-    for _inbound_id in $(printf '%s' "$_named_inbounds" | jq -r '.[].id'); do
-        _updated_inbound=$(printf '%s' "$_named_inbounds" | jq -c --argjson id "$_inbound_id" '.[] | select(.id == $id)') || return 1
-        _saved=$(panel_save inbounds edit "$_updated_inbound")
-        printf '%s' "$_saved" | jq -e '.success == true' >/dev/null || return 1
-    done
-    # Keep this run's node summary paired with its own port after renaming.
-    _hy2_id=$(printf '%s' "$_inbounds" | jq -r --arg tag "${HY2_TAG:-}" '.[] | select(.tag == $tag) | .id' | head -1)
-    _vless_id=$(printf '%s' "$_inbounds" | jq -r --arg tag "${VLESS_TAG:-}" '.[] | select(.tag == $tag) | .id' | head -1)
-    if [ -n "$_hy2_id" ]; then
-        HY2_TAG=$(printf '%s' "$_named_inbounds" | jq -r --argjson id "$_hy2_id" '.[] | select(.id == $id) | .tag')
-    fi
-    if [ -n "$_vless_id" ]; then
-        VLESS_TAG=$(printf '%s' "$_named_inbounds" | jq -r --argjson id "$_vless_id" '.[] | select(.id == $id) | .tag')
-    fi
+    apply_inbound_names "$_inbounds" || return 1
 
     _client_json=$(printf '%s' "$_inbounds" | jq -c \
         --arg name "$_client_name" --arg pass "$_client_pass" --arg uuid "$_client_uuid" \
@@ -2170,6 +2242,11 @@ main() {
         fi
     else
         log_info "Skipping VLESS + Reality"
+    fi
+
+    # Publish both address families even if the operator declines a new client.
+    if $HY2_OK || $VLESS_OK; then
+        prepare_dual_stack_inbounds || log_warn "Could not prepare the IPv6 inbound; review the inbound settings"
     fi
 
     # 5. The template is panel-wide, so include that effect in the question.

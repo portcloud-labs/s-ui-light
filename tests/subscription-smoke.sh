@@ -36,16 +36,16 @@ lookup_node_label
 [ "$NODE_LABEL" = '🇺🇸美国节点' ]
 curl() { echo '{"success":false,"country":"美国"}'; }
 lookup_node_label
-[ "$NODE_LABEL" = '🚀 加速节点' ]
+[ "$NODE_LABEL" = '🚀加速节点' ]
 curl() { echo 'not JSON'; return 0; }
 lookup_node_label
-[ "$NODE_LABEL" = '🚀 加速节点' ]
+[ "$NODE_LABEL" = '🚀加速节点' ]
 curl() { echo 'failure' >&2; return 28; }
 lookup_node_label 2>"$_TMP_TEST/stderr"
-[ "$NODE_LABEL" = '🚀 加速节点' ] && [ ! -s "$_TMP_TEST/stderr" ]
+[ "$NODE_LABEL" = '🚀加速节点' ] && [ ! -s "$_TMP_TEST/stderr" ]
 SUB_PUBLIC_HOST=''
 lookup_node_label
-[ "$NODE_LABEL" = '🚀 加速节点' ]
+[ "$NODE_LABEL" = '🚀加速节点' ]
 # URL output respects independent subscription TLS, domain and NAT overrides.
 SUB_CLIENT_NAME=test-client
 _hosts='8.8.8.8
