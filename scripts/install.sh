@@ -1910,7 +1910,7 @@ create_subscription_client() {
     # Use the inbound tag itself for the display name: s-ui inserts a hyphen
     # between client remark and tag, so a client prefix cannot produce the
     # requested compact name exactly. Full objects preserve credentials/TLS.
-    _named_inbounds=$(printf '%s' "$_inbounds" | jq -c --arg label "$NODE_LABEL" --arg host "$SUB_PUBLIC_HOST" '
+    _named_inbounds=$(printf '%s' "$_inbounds" | jq -c --arg node_label "$NODE_LABEL" --arg host "$SUB_PUBLIC_HOST" '
         sort_by(.id) | reduce .[] as $inb ({counts:{},items:[]};
             ($inb.type) as $type |
             (.counts[$type] // 0) as $count |
@@ -1920,7 +1920,7 @@ create_subscription_client() {
             .items += [($inb |
                 if $host != "" and ((.addrs // [])|length) == 0
                 then .addrs = [{server:$host, server_port:.listen_port, remark:""}] else . end |
-                .tag = ($label + (if ((.addrs[0].server // $host)|contains(":")) then " v6" else "" end) + " · " + $protocol +
+                .tag = ($node_label + (if ((.addrs[0].server // $host)|contains(":")) then " v6" else "" end) + " · " + $protocol +
                     (if $count == 0 then "" else " " + (($count + 1)|tostring) end)))]
         ) | .items') || return 1
     for _inbound_id in $(printf '%s' "$_named_inbounds" | jq -r '.[].id'); do

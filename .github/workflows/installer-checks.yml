@@ -1,0 +1,40 @@
+name: Installer checks
+
+on:
+  push:
+    paths:
+      - scripts/**
+      - tests/**
+      - .github/workflows/installer-checks.yml
+  pull_request:
+    paths:
+      - scripts/**
+      - tests/**
+      - .github/workflows/installer-checks.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Ubuntu 22.04 uses jq 1.6, while 24.04 uses jq 1.7.
+        image: [ubuntu:22.04, ubuntu:24.04]
+    container: ${{ matrix.image }}
+    steps:
+      - name: Install test dependencies
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o Dpkg::Use-Pty=0 ca-certificates git jq openssl
+          jq --version
+      - uses: actions/checkout@v4
+      - name: Check shell syntax and installer behavior
+        run: |
+          sh -n scripts/install.sh
+          for check in tests/*-smoke.sh; do
+            sh "$check"
+          done
