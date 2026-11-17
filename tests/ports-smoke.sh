@@ -9,7 +9,9 @@ _TMP=$(mktemp -d)
 trap 'rm -rf "$_TMP"' EXIT HUP INT TERM
 for value in 0 65536 -1 abc 1.5 9999999999999999999; do
     if normalize_port "$value" >/dev/null; then echo "Accepted invalid port $value"; exit 1; fi
-    if sh "$_SCRIPT" --panel-port "$value" >"$_TMP/error" 2>&1; then exit 1; fi
+    for _flag in --panel-port --sub-port --hy2-port --vless-port; do
+        if sh "$_SCRIPT" "$_flag" "$value" >"$_TMP/error" 2>&1; then exit 1; fi
+    done
 done
 [ "$(normalize_port 00080)" = 80 ]
 [ "$(normalize_port 65535)" = 65535 ]
@@ -52,4 +54,16 @@ sui() { printf '\tPanel port:\t2095\n\tSub port:\t2096\n'; }
 REQUESTED_PANEL_PORT=5000
 REQUESTED_SUB_PORT=5001
 if configure_ports >/dev/null 2>&1; then exit 1; fi
+ASSUME=yes
+PANEL_PORT=2095
+SUB_PORT=2096
+[ "$(choose_node_port Hy2 '' 25000)" = 25000 ]
+[ "$(choose_node_port VLESS '' 443 2>"$_TMP/warning")" = 443 ]
+grep -F 'Non-443' "$_TMP/warning" >/dev/null
+[ "$(choose_node_port VLESS 24443 443 2>/dev/null)" = 24443 ]
+if choose_node_port VLESS 2095 443 >/dev/null 2>&1; then exit 1; fi
+# UDP Hy2 is allowed to share a numeric port with TCP web listeners.
+[ "$(choose_node_port Hy2 2095 25000)" = 2095 ]
+[ "$(printf '2095\n2096\n24443\n' | prompt_port 'VLESS port' 443 '2095 2096' 2>/dev/null)" = 24443 ]
+if prompt_port 'VLESS port' 2095 '2095 2096' </dev/null >/dev/null 2>&1; then exit 1; fi
 echo 'Port ranges, defaults, CLI overrides, upgrade preservation, prompts, conflicts and readback passed'

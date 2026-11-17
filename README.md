@@ -42,7 +42,7 @@ Subscription port [2096]:
 3. **是否部署 Hysteria2 节点**（Y/n，回车默认 yes）。选 yes 会创建一个 Hysteria2 入站：
 
    - 复用上面生成的自签证书（第 2 步选了 no 就现在生成）
-   - 端口随机取 20000 以上
+   - 可输入 UDP 端口；回车默认使用本次随机生成的端口（20000–59999），提示会显示具体默认值
    - SNI 从几个热门站点中随机选一个
    - 已开启「允许不安全」（`client.insecure`），客户端无需校验证书
    - 新建入站默认启用 Salamander 混淆，每个入站独立生成 24 位安全随机字母数字密码；
@@ -61,7 +61,9 @@ Subscription port [2096]:
 
    - Reality 模式，不需要任何证书：服务端借用 SNI 所指站点的握手。密钥对通过
      面板的 `api/keypairs` 接口生成（X25519）
-   - 默认端口 **443/TCP**（不再随机）；请确保该端口未被其他服务占用
+   - 可输入 TCP 端口，回车默认 **443/TCP**；请确保该端口未被其他服务占用
+   - 选择端口时会提示：非 443 端口可能增加服务器 IP 被 GFW 封禁的风险。
+     该提示参照 [Xray REALITY 的端口警告](https://github.com/XTLS/Xray-core/blob/main/infra/conf/xray.go)
    - SNI 从几个热门站点中随机选一个（与第 3 步独立抽取），handshake 目标同 SNI，443 端口
    - short_id 随机生成（单个随机字节）
    - 客户端侧已开启 uTLS，指纹为 `chrome`
@@ -133,6 +135,8 @@ tail -f /var/log/s-ui.log           # 查看日志
 ./install.sh --version v1.4.2       # 指定版本（默认最新）
 ./install.sh --panel-port 3000     # 自定义面板端口（新安装默认 2095）
 ./install.sh --sub-port 3001       # 自定义订阅端口（新安装默认 2096）
+./install.sh --hy2-port 23456      # Hy2 UDP 端口（默认随机）
+./install.sh --vless-port 443      # VLESS TCP 端口（默认 443）
 ./install.sh --download-rate 256K   # 下载限速（低于 96 MiB 默认 1M，否则不限速；跳过询问）
 ./install.sh --low-mem on           # 强制低内存模式（默认 auto 自动检测）
 ./install.sh --uninstall            # 卸载
@@ -234,3 +238,20 @@ GeoIP 为数据库判断结果，可能与机房实际位置不同；IPv4 查询
 协议与名称检查：`sh tests/transport-smoke.sh`、`sh tests/node-names-smoke.sh`。
 端口检查：`sh tests/ports-smoke.sh`。
 已在真实 S-UI v1.6.6 中验证面板 HTTPS + 订阅 HTTP、切回全部 HTTP，以及 2096 返回的短名称、策略组引用及认证参数。
+
+### 节点端口
+
+选择创建节点后才会询问对应端口，例如：
+
+```text
+Hy2 port (random default) [28782]:
+[WRN] Non-443 VLESS ports may increase the risk of your server IP being blocked by the GFW.
+VLESS port [443]:
+```
+
+Hy2 回车使用显示的随机默认值；VLESS 回车使用 443。也可通过 `SUI_HY2_PORT`、
+`SUI_VLESS_PORT` 或 `--hy2-port`、`--vless-port` 直接指定，并跳过对应端口询问。
+显式指定端口不会自动开启对应协议，仍遵循创建节点的询问或 `--yes` / `--no-prompt`。
+
+端口范围为 1–65535。VLESS 的 TCP 端口不能与面板、订阅端口相同；Hy2 使用 UDP，
+可以与 TCP 服务共用相同的端口数字。摘要和订阅中的节点端口会使用实际选择值。

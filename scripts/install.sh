@@ -32,6 +32,8 @@
 #                            Skips the interactive rate question.
 #   --panel-port <port>     Panel TCP port (default: 2095; existing port on upgrades)
 #   --sub-port <port>       Subscription TCP port (default: 2096; existing port on upgrades)
+#   --hy2-port <port>       Hy2 UDP port (default: random 20000-59999)
+#   --vless-port <port>     VLESS TCP port (default: 443)
 #   --low-mem <auto|on|off>  Go memory guard (default: auto, enabled at <=256 MiB cgroup)
 #   --uninstall              Remove s-ui and its service
 #   --no-prompt              Skip every interactive question. Post-install steps
@@ -43,6 +45,8 @@
 #   SUI_DOWNLOAD_RATE   Same as --download-rate
 #   SUI_PANEL_PORT      Same as --panel-port
 #   SUI_SUB_PORT        Same as --sub-port
+#   SUI_HY2_PORT        Same as --hy2-port
+#   SUI_VLESS_PORT      Same as --vless-port
 #   SUI_LOW_MEM         Same as --low-mem
 #   SUI_SHA256          Expected sha256 of sui-<arch>, overrides the release digest
 #
@@ -120,6 +124,8 @@ PUBLIC_IPV6=""
 SUB_CLIENT_NAME=""
 REQUESTED_PANEL_PORT="${SUI_PANEL_PORT:-}"
 REQUESTED_SUB_PORT="${SUI_SUB_PORT:-}"
+REQUESTED_HY2_PORT="${SUI_HY2_PORT:-}"
+REQUESTED_VLESS_PORT="${SUI_VLESS_PORT:-}"
 
 # ── Low-memory / download defaults ───────────────────────────────────────────
 # curl does every download (it is already required by the panel API). Busybox
@@ -159,7 +165,7 @@ SNI_POOL="www.bing.com www.cloudflare.com www.apple.com www.microsoft.com www.am
 HY2_TAG_PREFIX="hysteria2"
 VLESS_TAG_PREFIX="vless-reality"
 
-# Accept TCP ports only; normalize decimal input without shell octal parsing.
+# Accept TCP/UDP port numbers; normalize decimal input without shell octal parsing.
 normalize_port() {
     case "$1" in ''|*[!0-9]*) return 1 ;; esac
     [ ${#1} -le 5 ] || return 1
@@ -172,15 +178,19 @@ prompt_port() {
     while :; do
         printf '%s [%s]: ' "$_port_label" "$_port_default" >&2
         _port_answer=""
-        read -r _port_answer || true
+        _port_eof=false
+        read -r _port_answer || _port_eof=true
         _port_answer="${_port_answer:-$_port_default}"
-        if _port_value=$(normalize_port "$_port_answer") && [ "$_port_value" != "$_port_excluded" ]; then
-            printf '%s\n' "$_port_value"
-            return 0
+        if _port_value=$(normalize_port "$_port_answer"); then
+            _port_valid=true
+            for _excluded in $_port_excluded; do
+                [ "$_port_value" != "$_excluded" ] || _port_valid=false
+            done
+            if $_port_valid; then printf '%s\n' "$_port_value"; return 0; fi
         fi
-        log_error 'Use a port from 1 to 65535, different from the other web port' >&2
+        log_error 'Invalid or conflicting port; use 1-65535' >&2
         # EOF cannot be corrected interactively; never loop forever on it.
-        if [ "$_port_answer" = "$_port_default" ] && [ "$_port_default" = "$_port_excluded" ]; then return 1; fi
+        if $_port_eof; then return 1; fi
     done
 }
 
@@ -212,6 +222,35 @@ configure_ports() {
     log_info "Panel port: $PANEL_PORT; subscription port: $SUB_PORT"
 }
 
+# Hy2 is UDP and may share a numeric port with the TCP panel/VLESS listeners.
+# VLESS is TCP and must not share a port with the panel or subscription server.
+choose_node_port() {
+    _node_protocol="$1"; _node_requested="$2"; _node_default="$3"
+    _node_excluded=""
+    if [ "$_node_protocol" = VLESS ]; then
+        _node_excluded="${PANEL_PORT:-2095} ${SUB_PORT:-2096}"
+        log_warn 'Non-443 VLESS ports may increase the risk of your server IP being blocked by the GFW.' >&2
+        _node_label='VLESS port'
+    else
+        _node_label='Hy2 port (random default)'
+    fi
+    if [ -n "$_node_requested" ]; then
+        _node_selected="$_node_requested"
+    elif [ -z "$ASSUME" ] && [ -t 0 ]; then
+        _node_selected=$(prompt_port "$_node_label" "$_node_default" "$_node_excluded") || return 1
+    else
+        _node_selected="$_node_default"
+    fi
+    _node_selected=$(normalize_port "$_node_selected") || return 1
+    for _node_conflict in $_node_excluded; do
+        if [ "$_node_selected" = "$_node_conflict" ]; then
+            log_error "VLESS port $_node_selected is already used by the panel or subscription listener" >&2
+            return 1
+        fi
+    done
+    printf '%s\n' "$_node_selected"
+}
+
 # ── Parse arguments ───────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -220,11 +259,13 @@ while [ $# -gt 0 ]; do
         --install-dir) INSTALL_DIR="$2"; shift 2 ;;
         --version)     VERSION="$2"; shift 2 ;;
         --download-rate) DOWNLOAD_RATE="$2"; DOWNLOAD_RATE_EXPLICIT=true; shift 2 ;;
-        --panel-port|--sub-port)
+        --panel-port|--sub-port|--hy2-port|--vless-port)
             if [ $# -lt 2 ] || [ -z "$2" ]; then log_error "$1 requires a port"; exit 1; fi
             case "$1" in
                 --panel-port) REQUESTED_PANEL_PORT="$2" ;;
                 --sub-port) REQUESTED_SUB_PORT="$2" ;;
+                --hy2-port) REQUESTED_HY2_PORT="$2" ;;
+                --vless-port) REQUESTED_VLESS_PORT="$2" ;;
             esac
             shift 2
             ;;
@@ -254,6 +295,12 @@ if [ -n "$REQUESTED_PANEL_PORT" ]; then
 fi
 if [ -n "$REQUESTED_SUB_PORT" ]; then
     REQUESTED_SUB_PORT=$(normalize_port "$REQUESTED_SUB_PORT") || { log_error 'Invalid subscription port (use 1-65535)'; exit 1; }
+fi
+if [ -n "$REQUESTED_HY2_PORT" ]; then
+    REQUESTED_HY2_PORT=$(normalize_port "$REQUESTED_HY2_PORT") || { log_error 'Invalid Hy2 port (use 1-65535)'; exit 1; }
+fi
+if [ -n "$REQUESTED_VLESS_PORT" ]; then
+    REQUESTED_VLESS_PORT=$(normalize_port "$REQUESTED_VLESS_PORT") || { log_error 'Invalid VLESS port (use 1-65535)'; exit 1; }
 fi
 if [ -n "$REQUESTED_PANEL_PORT" ] && [ "$REQUESTED_PANEL_PORT" = "$REQUESTED_SUB_PORT" ]; then
     log_error 'Panel port and subscription port must be different'
@@ -1259,10 +1306,7 @@ pick_sni() {
 
 # ── Deploy a Hysteria2 inbound ───────────────────────────────────────────────
 deploy_hysteria2() {
-    _port=$(random_port)
-    while [ "$_port" = "${PANEL_PORT:-2095}" ] || [ "$_port" = "${SUB_PORT:-2096}" ]; do
-        _port=$(( _port + 1 ))
-    done
+    _port=$(choose_node_port Hy2 "$REQUESTED_HY2_PORT" "$(random_port)") || return 1
     if ! pick_sni; then
         return 1
     fi
@@ -1376,11 +1420,7 @@ random_short_id() {
 # id (sid); s-ui carries both in the TLS record it writes the subscription
 # link from, so the link picks them up automatically.
 deploy_vless_reality() {
-    _port=443
-    if [ "$_port" = "${PANEL_PORT:-2095}" ] || [ "$_port" = "${SUB_PORT:-2096}" ]; then
-        log_error 'VLESS port 443 is already used by the panel or subscription listener'
-        return 1
-    fi
+    _port=$(choose_node_port VLESS "$REQUESTED_VLESS_PORT" 443) || return 1
     if ! pick_sni; then
         return 1
     fi
