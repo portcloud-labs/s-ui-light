@@ -24,7 +24,7 @@
 #   ./install.sh [OPTIONS]
 #
 # Options:
-#   --repo <user/repo>       GitHub repo (default: samoyed24/s-ui-light)
+#   --repo <user/repo>       GitHub repo (default: portcloud-labs/s-ui-light)
 #   --arch <arch>            Force architecture (amd64|arm64). Auto-detected by default.
 #   --install-dir <dir>      Installation directory. Default: /usr/local/s-ui
 #   --version <ver>          Specific version to install (default: latest)
@@ -101,7 +101,7 @@ ask() {
 }
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
-REPO="samoyed24/s-ui-light"
+REPO="portcloud-labs/s-ui-light"
 INSTALL_DIR="/usr/local/s-ui"
 DATA_DIR="/etc/s-ui"
 LOG_FILE="/var/log/s-ui.log"

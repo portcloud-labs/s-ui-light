@@ -7,7 +7,7 @@ GitHub Action 每日自动同步 s-ui 最新版本，单一安装脚本自动检
 ## 快速安装
 
 ```bash
-wget -O install.sh https://raw.githubusercontent.com/samoyed24/s-ui-light/main/scripts/install.sh && chmod +x install.sh && ./install.sh
+wget -O install.sh https://raw.githubusercontent.com/portcloud-labs/s-ui-light/main/scripts/install.sh && chmod +x install.sh && ./install.sh
 ```
 
 脚本会自动检测操作系统与架构：
