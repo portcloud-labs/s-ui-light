@@ -18,6 +18,16 @@ wget -O install.sh https://raw.githubusercontent.com/samoyed24/s-ui-light/main/s
 开始下载前会询问一次是否限速：低于 96 MiB 默认限速 1M/s，96 MiB 及以上默认不限速。
 提示会显示检测到的内存，无法检测时默认限速。下载过程带进度条。
 
+首次启动服务前可以设置面板端口和订阅端口，提示会显示默认值：
+
+```text
+Panel port [2095]:
+Subscription port [2096]:
+```
+
+直接回车使用默认值；重复安装时显示并保留已有端口。两个端口必须不同，且位于 1–65535。
+无人值守时使用已有端口或新安装默认值，也可通过参数或环境变量显式指定。
+
 ## 安装后会做什么
 
 安装完服务后，脚本会依次询问并完成五件事：
@@ -121,15 +131,18 @@ tail -f /var/log/s-ui.log           # 查看日志
 ```bash
 ./install.sh --arch arm64           # 指定架构（默认自动检测）
 ./install.sh --version v1.4.2       # 指定版本（默认最新）
+./install.sh --panel-port 3000     # 自定义面板端口（新安装默认 2095）
+./install.sh --sub-port 3001       # 自定义订阅端口（新安装默认 2096）
 ./install.sh --download-rate 256K   # 下载限速（低于 96 MiB 默认 1M，否则不限速；跳过询问）
 ./install.sh --low-mem on           # 强制低内存模式（默认 auto 自动检测）
 ./install.sh --uninstall            # 卸载
 ./install.sh --no-prompt            # 跳过所有交互（无人值守；下载按内存选择默认限速）
 ./install.sh --yes                  # 全部交互问题都答 yes
-./install.sh --no-stats             # 不上报本次运行，不打印总次数
 ```
 
 `--no-prompt` 适合脚本化部署：跳过 HTTPS、Hysteria2 与 VLESS，只装服务并重置密码。
+端口也可通过 `SUI_PANEL_PORT`、`SUI_SUB_PORT` 环境变量设置，命令行参数优先。例如：
+`./install.sh --no-prompt --panel-port 3000 --sub-port 3001`。
 没有终端时（如 `curl | sh`、cron）会跳过所有交互问题，不会卡住等待输入；下载按检测到的内存选择默认值：低于 96 MiB 限速 1M/s，96 MiB 及以上不限速；
 无法检测内存时保留 1M/s 限速。
 
@@ -175,38 +188,15 @@ tail -f /var/log/s-ui.log           # 查看日志
 推荐在极小内存容器上的用法：
 
 ```bash
-./install.sh --no-prompt --no-stats --download-rate 256K
+./install.sh --no-prompt --download-rate 256K
 ```
 
 `--no-prompt` 不建任何入站，内存占用最低。已在 64 MiB / 1 CPU 的 Alpine 容器上验证：
 安装与运行期间 `oom_kill` 计数未增加，面板 HTTPS 与登录正常。注意 64 MiB 依然非常紧，
 反复新开 SSH 会话可能挤掉 sshd 的 pre-auth 进程；如需多开节点，建议把容器限额提到 128–256 MiB。
 
-> 端口转发：容器内监听 2095/2096/TCP 与 Hysteria2 的 UDP 端口，是否在公网可达取决于
+> 端口转发：容器内监听 配置的面板/订阅 TCP 端口（默认 2095/2096） 与 Hysteria2 的 UDP 端口，是否在公网可达取决于
 > 宿主机的 NAT/端口映射，脚本无法代劳。
-
-## 运行次数统计
-
-脚本安装结束后会打印这个脚本累计被运行了多少次，例如：
-
-```
-[INF] Run counter: this script has been run 137 time(s) in total
-```
-
-脚本是 `wget | sh` 分发的单文件，自身不留任何状态，所以「总运行次数」只能来自
-一个共享计数器。实现方式：
-
-- 每次运行向 [Abacus](https://jasoncameron.dev/abacus/) 发一次
-  `GET /hit/s-ui-light/<仓库名>`，该接口**无需注册、无需 API key**（要注册或要 key
-  的服务都不适用 —— 写进公开脚本的 key 不是密钥），返回 `{"value": N}` 即为总次数。
-- 上报内容是**计数 +1**，不发送任何机器信息、版本号、IP 之外的数据。
-  服务端能看到你的公网 IP，这是任何联网请求都不可避免的。
-- 计数器名称带仓库名，所以 fork 出去的仓库各自独立计数。
-- 整个上报是**尽力而为**的：超时 5 秒，失败只打一条 `[WRN]`，不会中断安装，
-  也不会把「上报失败」显示成 0 次。
-- 不想上报就加 `--no-stats`，或直接不跑这一步。
-
-GitHub Release 的下载量不是替代方案 —— 它只反映有多少人下载过，不是运行次数。
 
 ## Salamander 验证范围
 
@@ -216,7 +206,7 @@ GitHub Release 的下载量不是替代方案 —— 它只反映有多少人下
 
 ## 安装完成后的访问地址
 
-部署摘要会尝试获取公网 IPv4、IPv6，并收集网卡地址，公网地址优先显示。
+部署摘要使用实际配置的面板、订阅端口生成链接，会尝试获取公网 IPv4、IPv6，并收集网卡地址，公网地址优先显示。
 同一个地址只显示一次（IPv6 不同写法也会去重），IPv6 链接自动加方括号。
 公网探测使用 ipify，每个请求最多等待 4 秒；网络不可用、超时或返回无效内容时
 静默跳过，不影响安装。NAT 服务器仍需由服务商配置端口映射，链接中的端口为面板监听端口。
@@ -242,4 +232,5 @@ GeoIP 为数据库判断结果，可能与机房实际位置不同；IPv4 查询
 完整订阅同时通过 Mihomo v1.19.32 的 `-t -f` 配置检查。摘要中的自动订阅链接仅使用通过公网地址检查的 IP。
 回归检查：`sh tests/subscription-smoke.sh`（需要 `jq`、`openssl`）。
 协议与名称检查：`sh tests/transport-smoke.sh`、`sh tests/node-names-smoke.sh`。
+端口检查：`sh tests/ports-smoke.sh`。
 已在真实 S-UI v1.6.6 中验证面板 HTTPS + 订阅 HTTP、切回全部 HTTP，以及 2096 返回的短名称、策略组引用及认证参数。

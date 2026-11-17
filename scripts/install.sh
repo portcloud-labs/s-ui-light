@@ -30,16 +30,19 @@
 #   --version <ver>          Specific version to install (default: latest)
 #   --download-rate <rate>   Cap the download (default: 1M below 96 MiB, otherwise 0).
 #                            Skips the interactive rate question.
+#   --panel-port <port>     Panel TCP port (default: 2095; existing port on upgrades)
+#   --sub-port <port>       Subscription TCP port (default: 2096; existing port on upgrades)
 #   --low-mem <auto|on|off>  Go memory guard (default: auto, enabled at <=256 MiB cgroup)
 #   --uninstall              Remove s-ui and its service
 #   --no-prompt              Skip every interactive question. Post-install steps
 #                            stay off; the download cap follows detected memory
 #   --yes                    Skip every interactive question (answer "yes" to each)
-#   --no-stats               Do not report this run to the public install counter
 #   -h, --help               Show this help
 #
 # Environment (useful for curl | sh, where no flags can be passed):
 #   SUI_DOWNLOAD_RATE   Same as --download-rate
+#   SUI_PANEL_PORT      Same as --panel-port
+#   SUI_SUB_PORT        Same as --sub-port
 #   SUI_LOW_MEM         Same as --low-mem
 #   SUI_SHA256          Expected sha256 of sui-<arch>, overrides the release digest
 #
@@ -115,7 +118,8 @@ PUBLIC_IPS_READY=false
 PUBLIC_IPV4=""
 PUBLIC_IPV6=""
 SUB_CLIENT_NAME=""
-NO_STATS=false
+REQUESTED_PANEL_PORT="${SUI_PANEL_PORT:-}"
+REQUESTED_SUB_PORT="${SUI_SUB_PORT:-}"
 
 # ── Low-memory / download defaults ───────────────────────────────────────────
 # curl does every download (it is already required by the panel API). Busybox
@@ -155,6 +159,59 @@ SNI_POOL="www.bing.com www.cloudflare.com www.apple.com www.microsoft.com www.am
 HY2_TAG_PREFIX="hysteria2"
 VLESS_TAG_PREFIX="vless-reality"
 
+# Accept TCP ports only; normalize decimal input without shell octal parsing.
+normalize_port() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ ${#1} -le 5 ] || return 1
+    awk -v port="$1" 'BEGIN { if (port+0 < 1 || port+0 > 65535) exit 1; printf "%d\n", port+0 }'
+}
+
+# Prompts go to stderr because the selected value is captured from stdout.
+prompt_port() {
+    _port_label="$1"; _port_default="$2"; _port_excluded="${3:-}"
+    while :; do
+        printf '%s [%s]: ' "$_port_label" "$_port_default" >&2
+        _port_answer=""
+        read -r _port_answer || true
+        _port_answer="${_port_answer:-$_port_default}"
+        if _port_value=$(normalize_port "$_port_answer") && [ "$_port_value" != "$_port_excluded" ]; then
+            printf '%s\n' "$_port_value"
+            return 0
+        fi
+        log_error 'Use a port from 1 to 65535, different from the other web port' >&2
+        # EOF cannot be corrected interactively; never loop forever on it.
+        if [ "$_port_answer" = "$_port_default" ] && [ "$_port_default" = "$_port_excluded" ]; then return 1; fi
+    done
+}
+
+# Called before starting the service, so occupied old/default listener ports
+# do not prevent a fresh installation from choosing different ports.
+configure_ports() {
+    read_panel_address
+    _selected_panel_port="${REQUESTED_PANEL_PORT:-$PANEL_PORT}"
+    _selected_sub_port="${REQUESTED_SUB_PORT:-$SUB_PORT}"
+    if [ -z "$ASSUME" ] && [ -t 0 ]; then
+        if [ -z "$REQUESTED_PANEL_PORT" ]; then
+            _selected_panel_port=$(prompt_port 'Panel port' "$_selected_panel_port" "$REQUESTED_SUB_PORT") || return 1
+        fi
+        if [ -z "$REQUESTED_SUB_PORT" ]; then
+            _selected_sub_port=$(prompt_port 'Subscription port' "$_selected_sub_port" "$_selected_panel_port") || return 1
+        fi
+    fi
+    if [ "$_selected_panel_port" = "$_selected_sub_port" ]; then
+        log_error 'Panel port and subscription port must be different'
+        return 1
+    fi
+    sui setting -port "$_selected_panel_port" -subPort "$_selected_sub_port" >/dev/null || return 1
+    # The upstream CLI may return zero after a settings error. Read it back.
+    read_panel_address
+    if [ "$PANEL_PORT" != "$_selected_panel_port" ] || [ "$SUB_PORT" != "$_selected_sub_port" ]; then
+        log_error 'Could not save the requested panel/subscription ports'
+        return 1
+    fi
+    log_info "Panel port: $PANEL_PORT; subscription port: $SUB_PORT"
+}
+
 # ── Parse arguments ───────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -163,11 +220,18 @@ while [ $# -gt 0 ]; do
         --install-dir) INSTALL_DIR="$2"; shift 2 ;;
         --version)     VERSION="$2"; shift 2 ;;
         --download-rate) DOWNLOAD_RATE="$2"; DOWNLOAD_RATE_EXPLICIT=true; shift 2 ;;
+        --panel-port|--sub-port)
+            if [ $# -lt 2 ] || [ -z "$2" ]; then log_error "$1 requires a port"; exit 1; fi
+            case "$1" in
+                --panel-port) REQUESTED_PANEL_PORT="$2" ;;
+                --sub-port) REQUESTED_SUB_PORT="$2" ;;
+            esac
+            shift 2
+            ;;
         --low-mem)       LOW_MEM="$2"; shift 2 ;;
         --uninstall)   UNINSTALL=true; shift ;;
         --yes)         ASSUME="yes"; shift ;;
         --no-prompt)   ASSUME="no"; shift ;;
-        --no-stats)    NO_STATS=true; shift ;;
         -h|--help)
             # Every leading comment line, minus the shebang, up to the first
             # real statement. Stopping at a blank line instead ended the range
@@ -183,6 +247,18 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+# Reject invalid explicit ports before package installation or downloads.
+if [ -n "$REQUESTED_PANEL_PORT" ]; then
+    REQUESTED_PANEL_PORT=$(normalize_port "$REQUESTED_PANEL_PORT") || { log_error 'Invalid panel port (use 1-65535)'; exit 1; }
+fi
+if [ -n "$REQUESTED_SUB_PORT" ]; then
+    REQUESTED_SUB_PORT=$(normalize_port "$REQUESTED_SUB_PORT") || { log_error 'Invalid subscription port (use 1-65535)'; exit 1; }
+fi
+if [ -n "$REQUESTED_PANEL_PORT" ] && [ "$REQUESTED_PANEL_PORT" = "$REQUESTED_SUB_PORT" ]; then
+    log_error 'Panel port and subscription port must be different'
+    exit 1
+fi
 
 # Certificates sit next to the binary so --install-dir moves them together.
 CERT_DIR="$INSTALL_DIR/cert"
@@ -1184,6 +1260,9 @@ pick_sni() {
 # ── Deploy a Hysteria2 inbound ───────────────────────────────────────────────
 deploy_hysteria2() {
     _port=$(random_port)
+    while [ "$_port" = "${PANEL_PORT:-2095}" ] || [ "$_port" = "${SUB_PORT:-2096}" ]; do
+        _port=$(( _port + 1 ))
+    done
     if ! pick_sni; then
         return 1
     fi
@@ -1298,6 +1377,10 @@ random_short_id() {
 # link from, so the link picks them up automatically.
 deploy_vless_reality() {
     _port=443
+    if [ "$_port" = "${PANEL_PORT:-2095}" ] || [ "$_port" = "${SUB_PORT:-2096}" ]; then
+        log_error 'VLESS port 443 is already used by the panel or subscription listener'
+        return 1
+    fi
     if ! pick_sni; then
         return 1
     fi
@@ -1371,11 +1454,11 @@ deploy_vless_reality() {
 read_panel_address() {
     _show=$(sui setting -show 2>/dev/null || true)
     PANEL_PORT=$(echo "$_show" | awk -F'\t' '/Panel port:/{print $NF}' | tr -d ' ')
+    SUB_PORT=$(echo "$_show" | awk -F'\t' '/Sub port:/{print $NF}' | tr -d ' ')
     PANEL_PATH=$(echo "$_show" | awk -F'\t' '/Panel path:/{print $NF}' | tr -d ' ')
 
-    case "$PANEL_PORT" in
-        ''|*[!0-9]*) PANEL_PORT="2095" ;;
-    esac
+    PANEL_PORT=$(normalize_port "${PANEL_PORT:-2095}") || PANEL_PORT=2095
+    SUB_PORT=$(normalize_port "${SUB_PORT:-2096}") || SUB_PORT=2096
     case "$PANEL_PATH" in
         /*) ;;
         *) PANEL_PATH="/app/" ;;
@@ -1877,7 +1960,7 @@ print_subscription_urls() {
 $_sub_hosts
 SUB_HOSTS
     fi
-    printf '    Keep this URL private. For NAT, use the public mapped subscription port (default internal port: 2096/TCP).\n'
+    printf '    Keep this URL private. For NAT, map the subscription port %s/TCP to its public port.\n' "$SUB_PORT"
 }
 
 # ── Report ───────────────────────────────────────────────────────────────────
@@ -1942,46 +2025,6 @@ ADDRESSES
     printf "${GREEN}==========================================================${NC}\n"
 }
 
-# ── Run counter ───────────────────────────────────────────────────────────────
-# Reports this run to a public counter and prints how many times the script has
-# been run in total. The script is delivered as a single file over wget|sh, so
-# it keeps no state of its own and a local tally would only ever describe the
-# one machine it sits on; a shared counter is the only way "total runs" means
-# anything.
-#
-# Abacus is used because it is the one counter that needs no signup: an API key
-# baked into a public script is not a secret, so keyed services are out.
-# The counter name carries the repo, so forks count separately.
-#
-# Reporting is best-effort in both directions. A failed request must never
-# abort an install that is otherwise fine, and a failure to report must not be
-# confused with a total of zero -- hence the "unknown" wording.
-report_run() {
-    if $NO_STATS; then
-        log_info "Run counter: skipped (--no-stats)"
-        return 0
-    fi
-
-    # curl, not wget: the panel API calls already require it, and it is the
-    # dependency check_deps guarantees. Give up quickly -- the install is
-    # already finished and nobody should wait on a tally.
-    _repo_slug=$(echo "$REPO" | tr '/.' '__')
-    _url="https://abacus.jasoncameron.dev/hit/s-ui-light/$_repo_slug"
-    _resp=$(curl -fsS --max-time 5 "$_url" 2>/dev/null || true)
-
-    # Response is {"value": 42}. Parse it without depending on a JSON tool:
-    # busybox has no jq, and this is a single flat field.
-    _count=$(echo "$_resp" | sed -n 's/.*"value"[: ]*\([0-9][0-9]*\).*/\1/p' | head -1)
-
-    if [ -n "$_count" ]; then
-        log_info "Run counter: this script has been run $_count time(s) in total"
-    else
-        # Offline, rate-limited (30 requests per 10s per IP), or the service is
-        # down. Say so plainly rather than printing a number that looks real.
-        log_warn "Run counter: unavailable (could not reach the counter service)"
-    fi
-}
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
     # Kept here rather than at the top level so --help works for non-root and
@@ -2005,6 +2048,7 @@ main() {
     check_deps
     get_version
     download_files
+    configure_ports || return 1
     install_service
     enable_and_start
 
@@ -2106,7 +2150,6 @@ main() {
     fi
     log_info "Logs:    tail -f $LOG_FILE"
 
-    report_run
 }
 
 # SUI_LIB_ONLY lets the smoke tests source this file to exercise the pure
